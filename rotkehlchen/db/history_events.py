@@ -701,7 +701,7 @@ class DBHistoryEvents:
             )
             prefix = 'SELECT *'
 
-        if entries_limit is None:
+        if entries_limit is None or entries_limit < 0:  # -1 means unlimited
             suffix, limit = base_suffix, []
         else:
             suffix, limit = (
@@ -1376,7 +1376,7 @@ class DBHistoryEvents:
 
         # When we have a limit but the total is already smaller or equal,
         # just return the total for both counts
-        if entries_limit is None or count_without_limit <= entries_limit:
+        if entries_limit is None or entries_limit < 0 or count_without_limit <= entries_limit:
             return count_without_limit, count_without_limit
 
         # Otherwise, get the limited count

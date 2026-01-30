@@ -216,7 +216,8 @@ class Accountant:
                 # API may time out
                 gevent.sleep(0.5)
             count += processed_events_num
-            if not active_premium and count >= FREE_PNL_EVENTS_LIMIT:
+            limit = FREE_PNL_EVENTS_LIMIT
+            if not active_premium and limit >= 0 and count >= limit:
                 log.debug(
                     f'PnL reports event processing has hit the event limit of {events_limit}. '
                     f'Processing stopped and the results will not '

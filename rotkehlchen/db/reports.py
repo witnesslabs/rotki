@@ -74,6 +74,8 @@ def _get_reports_or_events_maybe_limit(
         entries: list[dict[str, Any]] | list[ProcessedAccountingEvent],
         limit: int,
 ) -> tuple[list[dict[str, Any]] | list[ProcessedAccountingEvent], int, int | None]:
+    if limit < 0:  # -1 means unlimited
+        return entries, entries_found, entries_total
     returning_entries_length = min(limit, len(entries))
     return entries[:returning_entries_length], entries_found, entries_total
 
