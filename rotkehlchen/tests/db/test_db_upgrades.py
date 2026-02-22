@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
-from pysqlcipher3 import dbapi2 as sqlcipher
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.assets.utils import get_or_create_evm_token
 from rotkehlchen.chain.evm.accounting.structures import BaseEventSettings
@@ -55,6 +55,7 @@ from rotkehlchen.tests.utils.constants import A_LTC
 from rotkehlchen.tests.utils.database import (
     _use_prepared_db,
     column_exists,
+    index_exists,
     mock_db_schema_sanity_check,
     mock_dbhandler_sync_globaldb_assets,
     mock_dbhandler_update_owned_assets,
@@ -2147,7 +2148,7 @@ def test_upgrade_db_40_to_41(user_data_dir, address_name_priority, messages_aggr
         assert cursor.execute('SELECT COUNT(*) FROM evm_events_info').fetchone()[0] == 8
         assert cursor.execute(
             'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value=?',
-            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED),
+            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED.serialize_for_db()),
         ).fetchone()[0] == 1  # one event is customized
 
         # test eth2 validators and daily stats are there
@@ -2669,7 +2670,7 @@ def test_upgrade_db_45_to_46(user_data_dir: 'Path', messages_aggregator):
         # Make the existing evm event customized so it isn't removed during the upgrade
         write_cursor.execute(
             "INSERT INTO history_events_mappings(parent_identifier, name, value) VALUES ('35', ?, ?)",  # noqa: E501
-            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED),
+            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED.serialize_for_db()),
         )
 
     # Execute upgrade
@@ -2830,7 +2831,7 @@ def test_upgrade_db_46_to_47(user_data_dir, messages_aggregator):
         )
         write_cursor.execute(  # mark it a custom event to so event reset doesn't affect it.
             "INSERT INTO history_events_mappings(parent_identifier, name, value) VALUES ((SELECT identifier FROM history_events WHERE event_identifier='TEST1'), ?, ?)",  # noqa: E501
-            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED),
+            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED.serialize_for_db()),
         )
         write_cursor.executemany(
             'INSERT INTO evm_accounts_details(account, chain_id, key, value) VALUES(?, ?, ?, ?)',
@@ -3358,10 +3359,14 @@ def test_latest_upgrade_correctness(user_data_dir):
     assert views_after_creation - views_after_upgrade == set()
     new_tables = tables_after_upgrade - tables_before
     assert new_tables == {
+        'historical_balance_cache',
         'lido_csm_node_operators',
         'lido_csm_node_operator_metrics',
-        'event_metrics',
         'solana_ata_address_mappings',
+        'history_event_links',
+        'history_event_link_ignores',
+        'history_events_backup',
+        'chain_events_info_backup',
     }
     new_views = views_after_upgrade - views_before
     assert new_views == set()
@@ -3677,7 +3682,7 @@ def test_upgrade_db_49_to_50(user_data_dir, messages_aggregator):
         ]
         assert cursor.execute(
             'SELECT COUNT(*) FROM history_events_mappings WHERE parent_identifier=? AND name=? AND value=?',  # noqa: E501
-            (2, HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED),
+            (2, HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED.serialize_for_db()),
         ).fetchone()[0] == 1  # TEST_EVENT_2 is customized.
         assert not table_exists(cursor=cursor, name='accounting_rule_events')
         assert cursor.execute('SELECT type, subtype, counterparty FROM accounting_rules ORDER BY identifier').fetchall() == (rules := [  # noqa: E501
@@ -3761,7 +3766,7 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
     subtype_migration_query = (
         'SELECT h.identifier, h.type, h.subtype, c.counterparty '
         'FROM history_events h LEFT JOIN chain_events_info c ON h.identifier = c.identifier '
-        'WHERE h.identifier >= 5 ORDER BY h.identifier'
+        'WHERE h.identifier >= 5 AND h.identifier <= 9 ORDER BY h.identifier'
     )
     db_v50 = _init_db_with_target_version(
         target_version=50,
@@ -3772,8 +3777,8 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
     with db_v50.conn.read_ctx() as cursor:
         assert column_exists(cursor=cursor, table_name='history_events', column_name='event_identifier')  # noqa: E501
         assert not column_exists(cursor=cursor, table_name='history_events', column_name='group_identifier')  # noqa: E501
-        assert cursor.execute('SELECT COUNT(*) FROM chain_events_info').fetchone()[0] == 5
-        assert cursor.execute('SELECT identifier, event_identifier, sequence_index, asset FROM history_events ORDER BY identifier').fetchall() == (result := [  # noqa: E501
+        assert cursor.execute('SELECT COUNT(*) FROM chain_events_info').fetchone()[0] == 6
+        assert cursor.execute('SELECT identifier, event_identifier, sequence_index, asset FROM history_events WHERE identifier <= 9 ORDER BY identifier').fetchall() == (result := [  # noqa: E501
             (1, 'TEST_EVENT_1', 0, 'ETH'),
             (2, 'TEST_EVENT_2', 0, 'BTC'),
             (3, 'TEST_EVENT_3', 1, 'USD'),
@@ -3793,8 +3798,9 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
         ]
         assert not table_exists(cursor=cursor, name='lido_csm_node_operators')
         assert not table_exists(cursor=cursor, name='lido_csm_node_operator_metrics')
-        assert not table_exists(cursor=cursor, name='event_metrics')
         assert not table_exists(cursor=cursor, name='solana_ata_address_mappings')
+        assert not table_exists(cursor=cursor, name='history_events_backup')
+        assert not table_exists(cursor=cursor, name='chain_events_info_backup')
         assert cursor.execute(
             "SELECT COUNT(*) FROM location WHERE location = 'x'",
         ).fetchone()[0] == 0
@@ -3819,6 +3825,26 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
             'profiles',
             'default_profile_id',
         }.issubset(json.loads(raw_monerium_credentials))
+        assert cursor.execute(
+            'SELECT identifier, event_identifier, sequence_index, asset, amount, type, subtype '
+            'FROM history_events WHERE identifier >= 10 ORDER BY identifier',
+        ).fetchall() == ([
+            (10, 'TEST_EVENT_4', 0, 'eip155:1/erc20:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '200.000000', 'trade', 'spend'),  # noqa: E501
+            (11, 'TEST_EVENT_4', 1, 'USD', '200.00', 'trade', 'receive'),
+            (12, 'TEST_EVENT_5', 0, 'USD', '200.00', 'trade', 'spend'),
+            (13, 'TEST_EVENT_5', 1, 'USD', '200.00', 'trade', 'receive'),
+            kraken_deposit := (14, '10x8f91a9b98a856282cdad74d9b8a683504c13e3c9d810e4e22bd0ca2eb9d71800', 1, 'ETH', '100', 'deposit', 'deposit asset'),  # noqa: E501
+        ])
+        assert len(duplicate_internal_txs := cursor.execute(
+            """
+            SELECT parent_tx
+            FROM evm_internal_transactions
+            GROUP BY parent_tx, trace_id, from_address, to_address, value, gas_used
+            HAVING SUM(CASE WHEN gas = '0' THEN 1 ELSE 0 END) > 0
+               AND SUM(CASE WHEN gas != '0' THEN 1 ELSE 0 END) > 0
+            """,
+        ).fetchall()) > 0
+        duplicate_internal_parents = [entry[0] for entry in duplicate_internal_txs]
 
     db_v50.logout()
     db = _init_db_with_target_version(
@@ -3830,15 +3856,16 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
     with db.conn.read_ctx() as cursor:
         assert not column_exists(cursor=cursor, table_name='history_events', column_name='event_identifier')  # noqa: E501
         assert column_exists(cursor=cursor, table_name='history_events', column_name='group_identifier')  # noqa: E501
-        assert cursor.execute('SELECT COUNT(*) FROM chain_events_info').fetchone()[0] == 5
-        assert cursor.execute('SELECT identifier, group_identifier, sequence_index, asset FROM history_events ORDER BY identifier').fetchall() == result  # noqa: E501
+        assert cursor.execute('SELECT COUNT(*) FROM chain_events_info').fetchone()[0] == 6
+        assert cursor.execute('SELECT identifier, group_identifier, sequence_index, asset FROM history_events WHERE identifier <= 9 ORDER BY identifier').fetchall() == result  # noqa: E501
         assert cursor.execute(  # Verify the unique constraint was updated
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='history_events'",
         ).fetchone()[0].find('UNIQUE(group_identifier, sequence_index)') != -1
         assert table_exists(cursor=cursor, name='lido_csm_node_operators')
         assert table_exists(cursor=cursor, name='lido_csm_node_operator_metrics')
-        assert table_exists(cursor=cursor, name='event_metrics')
         assert table_exists(cursor=cursor, name='solana_ata_address_mappings')
+        assert table_exists(cursor=cursor, name='history_events_backup')
+        assert table_exists(cursor=cursor, name='chain_events_info_backup')
         assert cursor.execute(
             "SELECT COUNT(*) FROM location WHERE location = 'x' AND seq = 56",
         ).fetchone()[0] == 1
@@ -3861,7 +3888,7 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
             (5, 'deposit', 'deposit to protocol', 'aave-v3'),  # migrated
             (6, 'withdrawal', 'withdraw from protocol', 'aave-v3'),  # migrated
             (7, 'deposit', 'deposit asset', 'compound'),  # not customized
-            (8, 'deposit', 'deposit asset', None),  # asset movement
+            (8, 'exchange transfer', 'receive', None),  # asset movement
             (9, 'deposit', 'deposit asset', None),  # no counterparty
         ]
         assert json.loads(cursor.execute(
@@ -3873,5 +3900,48 @@ def test_upgrade_db_50_to_51(user_data_dir, messages_aggregator):
             'expires_at': 1765794259,
             'user_email': 'user@example.com',
         }
+        # Check that the USD->USD trade is removed and only the actual USDC->USD trade remains.
+        assert cursor.execute(
+            'SELECT identifier, group_identifier, sequence_index, asset, amount, type, subtype '
+            'FROM history_events WHERE identifier >= 10 ORDER BY identifier',
+        ).fetchall() == ([
+            (10, 'TEST_EVENT_4', 0, 'eip155:1/erc20:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '200.000000', 'trade', 'spend'),  # noqa: E501
+            (11, 'TEST_EVENT_4', 1, 'USD', '200.00', 'trade', 'receive'),
+            kraken_deposit,
+        ])
+        # Check that the existing indexes on the history events table are still present after
+        # changing the table schema during the upgrade.
+        for index_name in (
+            'idx_history_events_entry_type',
+            'idx_history_events_timestamp',
+            'idx_history_events_location',
+            'idx_history_events_location_label',
+            'idx_history_events_asset',
+            'idx_history_events_type',
+            'idx_history_events_subtype',
+            'idx_history_events_ignored',
+            'idx_history_events_entry_type',
+        ):
+            assert index_exists(cursor=cursor, name=index_name)
+        assert cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM evm_internal_transactions AS zero_gas
+            WHERE zero_gas.parent_tx IN ({})
+              AND zero_gas.gas = '0'
+              AND EXISTS (
+                  SELECT 1
+                  FROM evm_internal_transactions AS non_zero_gas
+                  WHERE non_zero_gas.parent_tx = zero_gas.parent_tx
+                    AND non_zero_gas.trace_id = zero_gas.trace_id
+                    AND non_zero_gas.from_address = zero_gas.from_address
+                    AND non_zero_gas.to_address IS zero_gas.to_address
+                    AND non_zero_gas.value = zero_gas.value
+                    AND non_zero_gas.gas_used = zero_gas.gas_used
+                    AND non_zero_gas.gas != '0'
+              )
+            """.format(','.join('?' * len(duplicate_internal_parents))),
+            duplicate_internal_parents,
+        ).fetchone()[0] == 0
 
     db.logout()

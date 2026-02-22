@@ -25,6 +25,7 @@ from rotkehlchen.api.v1.common_resources import BaseMethodView
 from rotkehlchen.api.v1.parser import ignore_kwarg_parser, resource_parser
 from rotkehlchen.api.v1.schemas import (
     AccountingReportDataSchema,
+    AccountingReportExportSchema,
     AccountingReportsSchema,
     AccountingRuleConflictsPagination,
     AccountingRulesQuerySchema,
@@ -73,6 +74,7 @@ from rotkehlchen.api.v1.schemas import (
     CurrentAssetsPriceSchema,
     CustomAssetsQuerySchema,
     CustomizedEventDuplicatesFixSchema,
+    CustomizedEventDuplicatesIgnoreSchema,
     DataImportSchema,
     DeletePremiumDeviceSchema,
     DetectTokensSchema,
@@ -90,6 +92,7 @@ from rotkehlchen.api.v1.schemas import (
     Eth2ValidatorPutSchema,
     Eth2ValidatorsGetSchema,
     EventDetailsQuerySchema,
+    EventGroupPositionSchema,
     EventsOnlineQuerySchema,
     EvmAccountsPutSchema,
     ExchangeBalanceQuerySchema,
@@ -113,7 +116,6 @@ from rotkehlchen.api.v1.schemas import (
     HistoricalPricesPerAssetSchema,
     HistoryEventSchema,
     HistoryEventsDeletionSchema,
-    HistoryExportingSchema,
     HistoryProcessingExportSchema,
     HistoryProcessingSchema,
     IgnoredActionsModifySchema,
@@ -152,6 +154,7 @@ from rotkehlchen.api.v1.schemas import (
     QueriedAddressesSchema,
     QueryAddressbookSchema,
     QueryCalendarSchema,
+    RefetchStakingEventsSchema,
     RefetchTransactionsSchema,
     RefreshProtocolDataSchema,
     ResolveEnsSchema,
@@ -160,6 +163,7 @@ from rotkehlchen.api.v1.schemas import (
     RpcNodeEditSchema,
     RpcNodeListDeleteSchema,
     RpcNodeSchema,
+    SchedulerSchema,
     SingleAssetIdentifierSchema,
     SingleAssetWithOraclesIdentifierSchema,
     SingleFileSchema,
@@ -183,7 +187,6 @@ from rotkehlchen.api.v1.schemas import (
     TransactionQuerySchema,
     TransactionReferenceAdditionSchema,
     TriggerTaskSchema,
-    UnlinkMatchedAssetMovementSchema,
     UpdateCalendarReminderSchema,
     UpdateCalendarSchema,
     UserActionLoginSchema,
@@ -1618,21 +1621,32 @@ class AccountingReportDataResource(BaseMethodView):
         return self.rest_api.get_report_data(filter_query=filter_query)
 
 
-class HistoryExportingResource(BaseMethodView):
+class AccountingReportExportResource(BaseMethodView):
 
-    get_schema = HistoryExportingSchema()
-
-    @require_loggedin_user()
-    @use_kwargs(get_schema, location='json_and_query')
-    def get(self, directory_path: Path) -> Response:
-        return self.rest_api.export_processed_history_csv(directory_path=directory_path)
-
-
-class HistoryDownloadingResource(BaseMethodView):
+    get_schema = AccountingReportExportSchema()
 
     @require_loggedin_user()
-    def get(self) -> Response:
-        return self.rest_api.download_processed_history_csv()
+    @use_kwargs(get_schema, location='json_and_query_and_view_args')
+    def get(self, report_id: int, directory_path: Path) -> Response:
+        return make_response_from_dict(
+            self.rest_api.history_service.export_pnl_report_csv(
+                report_id=report_id,
+                directory_path=directory_path,
+            ),
+        )
+
+
+class AccountingReportDownloadResource(BaseMethodView):
+
+    get_schema = AccountingReportsSchema(required_report_id=True)
+
+    @require_loggedin_user()
+    @use_kwargs(get_schema, location='view_args')
+    def get(self, report_id: int) -> Response:
+        response = self.rest_api.history_service.download_pnl_report_csv(report_id=report_id)
+        if isinstance(response, Response):
+            return response
+        return make_response_from_dict(response)
 
 
 class PeriodicDataResource(BaseMethodView):
@@ -2167,6 +2181,32 @@ class Eth2StakingEventsResource(BaseMethodView):
         return self.rest_api.redecode_eth2_block_events(
             async_query=async_query,
             block_numbers=block_numbers,
+        )
+
+
+class RefetchStakingEventsResource(BaseMethodView):
+
+    def make_post_schema(self) -> RefetchStakingEventsSchema:
+        return RefetchStakingEventsSchema(database=self.rest_api.rotkehlchen.data.db)
+
+    @require_loggedin_user()
+    @resource_parser.use_kwargs(make_post_schema, location='json')
+    def post(
+            self,
+            async_query: bool,
+            entry_type: Literal[HistoryBaseEntryType.ETH_BLOCK_EVENT, HistoryBaseEntryType.ETH_WITHDRAWAL_EVENT],  # noqa: E501
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+            validator_indices: list[int],
+            addresses: list[ChecksumEvmAddress],
+    ) -> Response:
+        return self.rest_api.refetch_staking_events(
+            async_query=async_query,
+            entry_type=entry_type,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            validator_indices=validator_indices,
+            addresses=addresses,
         )
 
 
@@ -3084,6 +3124,18 @@ class EventDetailsResource(BaseMethodView):
         return self.rest_api.get_event_details(identifier=identifier)
 
 
+class EventGroupPositionResource(BaseMethodView):
+    post_schema = EventGroupPositionSchema()
+
+    @require_loggedin_user()
+    @use_kwargs(post_schema, location='json')
+    def post(self, group_identifier: str, filter_query: 'HistoryBaseEntryFilterQuery') -> Response:
+        return self.rest_api.get_history_event_group_position(
+            group_identifier=group_identifier,
+            filter_query=filter_query,
+        )
+
+
 class AllEvmChainsResource(BaseMethodView):
 
     def get(self) -> Response:
@@ -3570,6 +3622,16 @@ class TriggerTaskResource(BaseMethodView):
         return self.rest_api.trigger_task(async_query=async_query, task=task)
 
 
+class SchedulerResource(BaseMethodView):
+
+    put_schema = SchedulerSchema()
+
+    @require_loggedin_user()
+    @use_kwargs(put_schema, location='json')
+    def put(self, enabled: bool) -> Response:
+        return self.rest_api.set_scheduler_state(enabled=enabled)
+
+
 class HistoricalPricesPerAssetResource(BaseMethodView):
 
     post_schema = HistoricalPricesPerAssetSchema()
@@ -3680,7 +3742,7 @@ class MatchAssetMovementsResource(BaseMethodView):
     get_schema = GetUnmatchedAssetMovementsSchema()
     put_schema = MatchAssetMovementsSchema()
     post_schema = FindPossibleMatchesSchema()
-    delete_schema = UnlinkMatchedAssetMovementSchema()
+    delete_schema = IntegerIdentifierSchema()
 
     @require_loggedin_user()
     @use_kwargs(get_schema, location='json_and_query')
@@ -3689,10 +3751,10 @@ class MatchAssetMovementsResource(BaseMethodView):
 
     @require_loggedin_user()
     @use_kwargs(put_schema, location='json')
-    def put(self, asset_movement: int, matched_event: int | None) -> Response:
+    def put(self, asset_movement: int, matched_events: list[int]) -> Response:
         return self.rest_api.match_asset_movements(
             asset_movement_identifier=asset_movement,
-            matched_event_identifier=matched_event,
+            matched_event_identifiers=matched_events,
         )
 
     @require_loggedin_user()
@@ -3713,16 +3775,26 @@ class MatchAssetMovementsResource(BaseMethodView):
 
     @require_loggedin_user()
     @use_kwargs(delete_schema, location='json')
-    def delete(self, asset_movement: int) -> Response:
-        return self.rest_api.unlink_matched_asset_movements(
-            asset_movement_identifier=asset_movement,
-        )
+    def delete(self, identifier: int) -> Response:
+        return self.rest_api.unlink_matched_asset_movements(identifier=identifier)
 
 
 class CustomizedEventDuplicatesResource(BaseMethodView):
 
     get_schema = AsyncQueryArgumentSchema()
     post_schema = CustomizedEventDuplicatesFixSchema()
+
+    def make_put_schema(self) -> CustomizedEventDuplicatesIgnoreSchema:
+        return CustomizedEventDuplicatesIgnoreSchema(
+            db=self.rest_api.rotkehlchen.data.db,
+            action='ignore',
+        )
+
+    def make_delete_schema(self) -> CustomizedEventDuplicatesIgnoreSchema:
+        return CustomizedEventDuplicatesIgnoreSchema(
+            db=self.rest_api.rotkehlchen.data.db,
+            action='unignore',
+        )
 
     @require_loggedin_user()
     @use_kwargs(get_schema, location='json_and_query')
@@ -3733,6 +3805,22 @@ class CustomizedEventDuplicatesResource(BaseMethodView):
     @use_kwargs(post_schema, location='json_and_query')
     def post(self, group_identifiers: list[str] | None, async_query: bool) -> Response:
         return self.rest_api.fix_customized_event_duplicates(
+            async_query=async_query,
+            group_identifiers=group_identifiers,
+        )
+
+    @require_loggedin_user()
+    @resource_parser.use_kwargs(make_put_schema, location='json')
+    def put(self, group_identifiers: list[str], async_query: bool) -> Response:
+        return self.rest_api.ignore_customized_event_duplicates(
+            async_query=async_query,
+            group_identifiers=group_identifiers,
+        )
+
+    @require_loggedin_user()
+    @resource_parser.use_kwargs(make_delete_schema, location='json')
+    def delete(self, group_identifiers: list[str], async_query: bool) -> Response:
+        return self.rest_api.unignore_customized_event_duplicates(
             async_query=async_query,
             group_identifiers=group_identifiers,
         )

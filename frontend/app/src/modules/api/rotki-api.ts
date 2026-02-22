@@ -78,7 +78,8 @@ export class RotkiApi {
   }
 
   buildUrl(path: string, query?: Record<string, unknown>): string {
-    const url = new URL(path, this._baseURL);
+    const base = /^https?:\/\//.test(this._baseURL) ? this._baseURL : `${window.location.origin}${this._baseURL}`;
+    const url = new URL(path, base);
     if (query) {
       const transformedQuery = queryTransformer(query);
       for (const [key, value] of Object.entries(transformedQuery)) {
@@ -149,6 +150,7 @@ export class RotkiApi {
       treat409AsSuccess,
       filterEmptyProperties,
       retry,
+      skipAuthHandler,
       ...fetchOptions
     } = options;
 
@@ -169,8 +171,13 @@ export class RotkiApi {
 
       const status = response.status;
 
-      if (status === HTTPStatus.UNAUTHORIZED)
-        this.handleAuthFailure();
+      if (status === HTTPStatus.UNAUTHORIZED) {
+        if (!skipAuthHandler)
+          this.handleAuthFailure();
+
+        const responseData = response._data;
+        throw createStatusError(status, responseData?.message, responseData);
+      }
 
       const allowedStatuses = validStatuses ?? VALID_STATUS_CODES;
       if (!allowedStatuses.includes(status)) {

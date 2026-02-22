@@ -157,6 +157,8 @@ cargo run -- --database ../data/global.db --port 4343
 - **Always return explicit types from functions**: `function getName(): string { ... }`
 - **Always type reactive variables**: `const isLoading = ref<boolean>(false)`
 - **Always type computed properties**: `const fullName = computed<string>(() => ...)`
+- If a ref type can be undefined and the default value is undefined, **Don't explicitly put it as type or default value**: `const newId = ref<number>()`
+- **Always use `{ useScope: 'global' }` parameter for `useI18n()`**: `const { t } = useI18n({ useScope: 'global' });`
 
 #### Correct Examples:
 
@@ -169,8 +171,11 @@ const count = ref<number>(0);
 const items = ref<string[]>([]);
 const user = ref<User>();
 
+const { t } = useI18n({ useScope: 'global' });
+
 const isEven = computed<boolean>(() => get(count) % 2 === 0);
 const formattedName = computed<string>(() => `${get(firstName)} ${get(lastName)}`);
+const newId = ref<number>(); // this newId type is number | undefined.
 
 function getUserById(id: number): User | undefined {
   return get(users).find(user => user.id === id) || undefined;
@@ -194,8 +199,11 @@ const count = ref(0);
 const items = ref([]);
 const user = ref();
 
+const { t } = useI18n();
+
 const isEven = computed(() => count.value % 2 === 0);
 const formattedName = computed(() => `${firstName.value} ${lastName.value}`);
+const newId = ref<number | undefined>(undefined);
 
 function getUserById(id: number) {
   return users.value.find(user => user.id === id) || undefined;
@@ -224,14 +232,72 @@ async function fetchData() {
 11. Exposed methods
 
 #### Component Conventions
-- Use `defineProps<{}>()` instead of `defineProps({})`
-- Simplified emit definitions:
+
+##### Props — destructured with defaults (Vue 3.5+)
+- Prefer destructured props with inline defaults over `withDefaults`:
+  ```typescript
+  // ✅ Preferred (Vue 3.5+)
+  const { title, count = 0, disabled = false } = defineProps<{
+    title: string;
+    count?: number;
+    disabled?: boolean;
+  }>();
+
+  // ❌ Legacy — avoid in new code
+  const props = withDefaults(defineProps<{
+    title: string;
+    count?: number;
+    disabled?: boolean;
+  }>(), {
+    count: 0,
+    disabled: false,
+  });
+  ```
+- For mutable default values (arrays, objects), use a factory function:
+  ```typescript
+  const { items = () => [], filters = () => ({}) } = defineProps<{
+    items?: string[];
+    filters?: Record<string, string>;
+  }>();
+  ```
+
+##### Emits — typed tuple syntax
+- Use the typed tuple syntax for emit definitions:
   ```typescript
   const emit = defineEmits<{
     'update:msg': [msg: string];
+    'delete': [id: number];
   }>();
   ```
-- Use `$style` in templates instead of `useCssModules`
+
+##### v-model — `defineModel` (Vue 3.4+)
+- Use `defineModel` for all v-model bindings instead of manual prop + emit:
+  ```typescript
+  // ✅ Correct — defineModel
+  const modelValue = defineModel<string>({ required: true });
+  const selected = defineModel<number>('selected');
+  const filters = defineModel<Filters>('filters', { default: () => ({}) });
+
+  // ❌ Incorrect — manual prop + emit for v-model
+  const props = defineProps<{ modelValue: string }>();
+  const emit = defineEmits<{ 'update:modelValue': [value: string] }>();
+  ```
+
+##### Template refs — `useTemplateRef` (Vue 3.5+)
+- Use `useTemplateRef` for typed template refs:
+  ```typescript
+  // ✅ Correct — Vue 3.5+
+  import { useTemplateRef } from 'vue';
+  const formRef = useTemplateRef<InstanceType<typeof MyForm>>('formRef');
+
+  // ❌ Incorrect — old pattern
+  const formRef = ref<InstanceType<typeof MyForm>>();
+  ```
+  ```html
+  <MyForm ref="formRef" />
+  ```
+
+##### Other conventions
 - Use `$attrs` in templates instead of `useAttrs`
 
 #### Pinia Store Structure
@@ -241,14 +307,17 @@ async function fetchData() {
 4. Optional watchers
 
 #### Styling
-- Transitioning from scoped SCSS with BEM to tailwind
-- Follow existing patterns for consistency
+- Use Tailwind CSS for all styling
+- Scoped CSS modules (`<style module>`) should only be used for Vue `TransitionGroup` animations
+- Do not use scoped SCSS with BEM naming conventions
 
 #### Localization
 - For the localization files (en.json, es.json, etc.), the keys should be ordered alphabetically.
+- Avoid dynamic keys for translations, as they can break the linter.
 
 #### Testing
-- Run tests with `pnpm run test:unit` from `frontend/` directory
+- Run all tests with `pnpm run test:unit` from `frontend/` directory
+- Run a single test file: `pnpm run test:unit src/modules/path/to/file.spec.ts` (no `-- --run` needed)
 - Use Vitest for unit tests with Vue Test Utils
 - **Unit test file naming**: `.spec.ts` files should follow the naming of the tested file and be located in the same folder
   ```
@@ -281,6 +350,42 @@ As an example decoder, we can look at [MakerDAO](https://github.com/rotki/rotki/
 It needs to contain a class that inherits from the `DecoderInterface` and is named `ModulenameDecoder`.
 
 Note: If your new decoder decodes an airdrop's claiming event and this airdrop is present in the [data repo airdrop index](https://github.com/rotki/data/blob/develop/airdrops/index_v2.json) with `has_decoder` as `false`, please update that also.
+
+### Decoder scope policy (performance-critical)
+
+- Prefer `addresses_to_decoders()` over generic `decoding_rules()` whenever a protocol emits identifiable logs from known contract addresses.
+- Use `decoding_rules()` only as a last resort when no reliable address/topic/input selector scoping exists.
+
+Why:
+- `decoding_rules()` are evaluated for every log in every transaction on that chain, which increases per-log decoding overhead.
+- `addresses_to_decoders()` restricts execution to logs from relevant protocol contracts, reducing unnecessary rule invocations and improving decode throughput.
+- Narrow-scoped decoders also reduce false positives and make behavior easier to reason about.
+
+### ActionItem matching rule (avoid redundant log scans)
+
+- When creating an `ActionItem` from a log handler, prefer using data already available in the current `context.tx_log` for matching fields (`amount`, `asset`, `location_label`, `to_address`) whenever possible.
+- Do not iterate `context.all_logs` just to rediscover transfer data if the current log already provides the same amount/address relation.
+- Only scan `context.all_logs` when correlating multiple distinct logs is strictly required.
+
+Why:
+- Reduces per-transaction work and decoder complexity.
+- Avoids introducing fragile cross-log assumptions.
+- Keeps action-item transformations deterministic and easier to review.
+
+### Fallback when chain indexers are unavailable
+
+If a chain cannot be queried via explorer/indexer APIs (`etherscanscan` / `routescan` / `blockscout` etc ), do not stop. Use this fallback flow:
+
+1. Add a public RPC node for the chain in the test via `*_manager_connect_at_start` + `WeightedNode(NodeName(...))`.
+2. Query tx/receipt/logs from RPC directly (not from explorer APIs).
+3. If internal txs are not needed for the specific decoder path, patch:
+   `rotkehlchen.chain.evm.transactions.EvmTransactions._query_and_save_internal_transactions_for_range_or_parent_hash`
+   to return `[]`.
+4. Keep the test focused on decoded events from logs/transfers.
+5. Prefer deterministic assertions and exact tx-hash regression tests.
+6. Do not block on explorer availability; only ask the user if RPC data is insufficient.
+
+Example intent: Base currently may fail on explorer/indexer paths; use `https://mainnet.base.org` until indexers recover.
 
 #### Counterparties
 
@@ -320,10 +425,39 @@ Each combination of event type and subtype and counterparty creates a new unique
 
 The mapping of these HistoryEvents types, subtypes, and categories is done in [rotkehlchen/accounting/constants.py](https://github.com/rotki/rotki/blob/17b4368bc15043307fa6acf536b5237b3840c40e/rotkehlchen/accounting/constants.py).
 
-#### Things to keep in mind
+### Hex / bytes constants policy (strict)
 
+- Never manually transcribe event topics, method selectors, hashes, or byte constants into Python byte literals.
+- Always derive byte constants programmatically from canonical hex with `bytes.fromhex(...)` (or equivalent safe conversion).
+- When source data is on-chain/API, copy exact `0x...` values and normalize with:
+  - `hex_str = value.removeprefix('0x')`
+  - `const = bytes.fromhex(hex_str)`
+- Always verify round-trip before finalizing:
+  - `assert const.hex() == hex_str.lower()`
+- Prefer storing canonical constants as hex strings + conversion, rather than hand-written escaped byte literals.
 - All byte signatures should be a constant byte literal. Like ```DEPOSIT_TOPIC: Final = b'\xdc\xbc\x1c\x05$\x0f1\xff:\xd0g\xef\x1e\xe3\\\xe4\x99wbu.:\tR\x84uED\xf4\xc7\t\xd7'```
 - Don't put assets as constants. If you need a constant just use the asset identifier as a string and compare against it.
+
+## Rotki Backend Style Preferences (strict)
+
+When editing backend Python and tests, follow these preferences unless explicitly told otherwise:
+
+1. Prefer narrow exceptions.
+ - Do not use `except Exception`.
+ - Catch the concrete error type used by the surrounding code path (e.g. `RemoteError` for rpc/multicall).
+
+ 2. Prefer inline one-time assignment via walrus operator.
+ - If a variable is used only once in a small local scope, inline it with `:=` instead of introducing a standalone line.
+ - Apply this especially in tests for constants like `timestamp`, `amount_str`, `gas_str`, `user_address`.
+ - Example: `location_label=(user_address := ethereum_accounts[0])`.
+
+ 3. Avoid unnecessary temporary locals.
+ - If a value is only used once and readability is preserved, inline it.
+ - Keep code compact and avoid “setup variable blocks” in tests.
+
+ 4. Keep existing codebase idioms first.
+ - Match nearby file style even if generic Python style differs.
+ - For rotki tests, prefer concise expected-event construction with inline assignments where practical.
 
 ## Testing Strategy
 
@@ -338,6 +472,7 @@ The mapping of these HistoryEvents types, subtypes, and categories is done in [r
 
 ### Frontend Testing
 - Vitest for unit tests with Vue Test Utils
+- Playwright for E2E testing
 - Component tests should follow existing patterns in `frontend/app/tests/` and `*.spec.ts`
 
 ## Packaging

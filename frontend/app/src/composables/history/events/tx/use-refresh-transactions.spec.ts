@@ -6,6 +6,16 @@ import { OnlineHistoryEventsQueryType } from '@/types/history/events/schemas';
 import { Status } from '@/types/status';
 import { useRefreshTransactions } from './use-refresh-transactions';
 
+const mockOnHistoryStarted = vi.fn();
+const mockOnHistoryFinished = vi.fn();
+
+vi.mock('@/composables/session/use-scheduler-state', () => ({
+  useSchedulerState: vi.fn(() => ({
+    onHistoryStarted: mockOnHistoryStarted,
+    onHistoryFinished: mockOnHistoryFinished,
+  })),
+}));
+
 const mockEvmAccounts: ChainAddress[] = [
   { address: '0x5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c', chain: 'eth' },
   { address: '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199', chain: 'optimism' },
@@ -65,8 +75,9 @@ const mockRefreshHandlers = {
   queryOnlineEvent: vi.fn().mockResolvedValue(undefined),
 };
 
-const mockSessionSettingsStore = {
-  connectedExchanges: ref<Exchange[]>(mockExchanges),
+const mockExchangeData = {
+  isSameExchange: (a: Exchange, b: Exchange): boolean => a.location === b.location && a.name === b.name,
+  syncingExchanges: ref<Exchange[]>(mockExchanges),
 };
 
 vi.mock('./use-history-transaction-accounts', () => ({
@@ -97,8 +108,8 @@ vi.mock('./refresh-handlers', () => ({
   useRefreshHandlers: vi.fn(() => mockRefreshHandlers),
 }));
 
-vi.mock('@/store/settings/session', () => ({
-  useSessionSettingsStore: vi.fn(() => mockSessionSettingsStore),
+vi.mock('@/modules/balances/exchanges/use-exchange-data', () => ({
+  useExchangeData: vi.fn(() => mockExchangeData),
 }));
 
 vi.mock('@/store/history/query-status/tx-query-status', () => ({
@@ -223,7 +234,7 @@ describe('useRefreshTransactions', () => {
 
       await refreshTransactions();
 
-      expect(mockRefreshHandlers.queryAllExchangeEvents).toHaveBeenCalledWith(undefined);
+      expect(mockRefreshHandlers.queryAllExchangeEvents).toHaveBeenCalledWith(mockExchanges);
       expect(mockEventsQueryStatusStore.initializeQueryStatus).toHaveBeenCalled();
     });
   });
@@ -451,6 +462,80 @@ describe('useRefreshTransactions', () => {
       await refreshTransactions();
 
       expect(mockStatusUpdater.fetchDisabled).toHaveBeenCalledWith(false);
+    });
+  });
+
+  describe('scheduler state hooks', () => {
+    it('should call onHistoryStarted when refresh starts with accounts', async () => {
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions();
+
+      expect(mockOnHistoryStarted).toHaveBeenCalledTimes(1);
+    });
+
+    it('should call onHistoryFinished when refresh completes', async () => {
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions();
+
+      expect(mockOnHistoryFinished).toHaveBeenCalledTimes(1);
+    });
+
+    it('should call onHistoryFinished even when errors occur', async () => {
+      mockTransactionSync.syncTransactionsByChains.mockRejectedValue(new Error('Sync failed'));
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions();
+
+      expect(mockOnHistoryFinished).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not call onHistoryStarted when no accounts or exchanges to refresh', async () => {
+      mockHistoryTransactionAccounts.getAllAccounts.mockReturnValue([]);
+      set(mockExchangeData.syncingExchanges, []);
+
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions({
+        payload: { accounts: [], exchanges: [] },
+      });
+
+      expect(mockOnHistoryStarted).not.toHaveBeenCalled();
+    });
+
+    it('should call onHistoryStarted before sync operations', async () => {
+      const callOrder: string[] = [];
+
+      mockOnHistoryStarted.mockImplementation(() => {
+        callOrder.push('onHistoryStarted');
+      });
+      mockTransactionSync.syncTransactionsByChains.mockImplementation(async () => {
+        callOrder.push('syncTransactionsByChains');
+      });
+
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions();
+
+      expect(callOrder.indexOf('onHistoryStarted')).toBeLessThan(callOrder.indexOf('syncTransactionsByChains'));
+    });
+
+    it('should call onHistoryFinished after all operations complete', async () => {
+      const callOrder: string[] = [];
+
+      mockTransactionSync.syncTransactionsByChains.mockImplementation(async () => {
+        callOrder.push('syncTransactionsByChains');
+      });
+      mockOnHistoryFinished.mockImplementation(() => {
+        callOrder.push('onHistoryFinished');
+      });
+
+      const { refreshTransactions } = useRefreshTransactions();
+
+      await refreshTransactions();
+
+      expect(callOrder.indexOf('syncTransactionsByChains')).toBeLessThan(callOrder.indexOf('onHistoryFinished'));
     });
   });
 });

@@ -38,12 +38,16 @@ const showLocationLabel = computed<boolean>(() => {
 </script>
 
 <template>
-  <div class="flex items-center text-left">
+  <div
+    data-cy="event-type"
+    class="flex items-center text-left min-w-0"
+  >
     <HistoryEventTypeCounterparty
       v-if="('counterparty' in event && event.counterparty) || ('address' in event && event.address)"
       :counterparty="event.counterparty || undefined"
       :address="event.address || undefined"
       :location="event.location"
+      class="shrink-0"
     >
       <HistoryEventTypeCombination
         :highlight="highlight"
@@ -58,10 +62,11 @@ const showLocationLabel = computed<boolean>(() => {
       :icon="icon"
       :type="attrs"
       :show-info="isInformational"
+      class="shrink-0"
     />
 
-    <div class="ml-4">
-      <div class="font-bold uppercase">
+    <div class="ml-3 min-w-0">
+      <div class="font-medium uppercase text-sm truncate">
         {{ attrs.label }}
       </div>
       <HistoryEventAccount
@@ -72,7 +77,7 @@ const showLocationLabel = computed<boolean>(() => {
       />
       <div
         v-if="eventStates.length > 0 && !hideStateChips"
-        class="flex flex-wrap gap-0.5 mt-1"
+        class="flex flex-wrap gap-0.5"
       >
         <HistoryEventStateChip
           v-for="state in eventStates"

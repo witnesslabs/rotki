@@ -17,17 +17,19 @@ interface UseAssetIconApiReturn {
 
 export function useAssetIconApi(): UseAssetIconApiReturn {
   const assetImageUrl = (identifier: string, randomString?: string | number): string => {
-    let url = `${defaultApiUrls.colibriApiUrl}/assets/icon?asset_id=${encodeURIComponent(identifier)}`;
+    const url = new URL('/assets/icon', defaultApiUrls.colibriApiUrl);
+    url.searchParams.set('asset_id', identifier);
 
     if (randomString)
-      url += `&t=${randomString}`;
+      url.searchParams.set('t', String(randomString));
 
-    return url;
+    return url.toString();
   };
 
   const checkAsset = async (identifier: string, options: CheckAssetOptions): Promise<number> => {
-    const url = `/assets/icon?asset_id=${encodeURIComponent(identifier)}`;
-    return api.headStatus(url, {
+    const params = new URLSearchParams();
+    params.set('asset_id', identifier);
+    return api.headStatus(`/assets/icon?${params.toString()}`, {
       baseURL: defaultApiUrls.colibriApiUrl,
       signal: options.abortController?.signal,
       validStatuses: [HTTPStatus.OK, HTTPStatus.ACCEPTED, HTTPStatus.NOT_FOUND],

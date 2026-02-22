@@ -9,15 +9,16 @@ import HistoryEventsFiltersChips from '@/components/history/events/HistoryEvents
 import HistoryEventsTableActions from '@/components/history/events/HistoryEventsTableActions.vue';
 import HistoryEventsViewButtons from '@/components/history/events/HistoryEventsViewButtons.vue';
 import TablePageLayout from '@/components/layout/TablePageLayout.vue';
-import CardTitle from '@/components/typography/CardTitle.vue';
 import { HISTORY_EVENT_ACTIONS, type HistoryEventAction } from '@/composables/history/events/types';
 import { useHistoryEventsActions } from '@/composables/history/events/use-history-events-actions';
-import { useHistoryEventsFilters } from '@/composables/history/events/use-history-events-filters';
-import HistoryEventsTable from '@/modules/history/events/components/HistoryEventsTable.vue';
+import { getDefaultToggles, useHistoryEventNavigationConsumer, useHistoryEventsFilters } from '@/composables/history/events/use-history-events-filters';
+import { useUnmatchedAssetMovements } from '@/composables/history/events/use-unmatched-asset-movements';
+import HistoryEventsVirtualTable from '@/modules/history/events/components/HistoryEventsVirtualTable.vue';
 import { useHistoryEventsDeletion } from '@/modules/history/events/composables/use-history-events-deletion';
 import { useHistoryEventsSelectionActions } from '@/modules/history/events/composables/use-history-events-selection-actions';
 import { useHistoryEventsSelectionMode } from '@/modules/history/events/composables/use-selection-mode';
 import { useHistoryEventsStatus } from '@/modules/history/events/use-history-events-status';
+import { useHistoryStore } from '@/store/history';
 
 defineOptions({ inheritAttrs: false });
 
@@ -72,18 +73,23 @@ const {
   validators,
 } = toRefs(props);
 
-const toggles = ref<HistoryEventsToggles>({
-  customizedEventsOnly: false,
-  matchExactEvents: false,
-  showIgnoredAssets: false,
-  virtualEventsOnly: false,
-});
+const toggles = ref<HistoryEventsToggles>(getDefaultToggles());
 
 const showAlerts = ref<boolean>(false);
-const manualIssueCheck = ref<boolean>(false);
 const currentAction = ref<HistoryEventAction>(HISTORY_EVENT_ACTIONS.QUERY);
 
 const dialogContainer = useTemplateRef<InstanceType<typeof HistoryEventsDialogContainer>>('dialogContainer');
+const syncProgressPanelEl = useTemplateRef<ComponentPublicInstance>('syncProgressPanel');
+const tableActionsEl = useTemplateRef<ComponentPublicInstance>('tableActions');
+const filtersChipsEl = useTemplateRef<ComponentPublicInstance>('filtersChips');
+
+const { height: syncProgressHeight } = useElementSize(syncProgressPanelEl);
+const { height: tableActionsHeight } = useElementSize(tableActionsEl);
+const { height: filtersChipsHeight } = useElementSize(filtersChipsEl);
+
+const BASE_TABLE_HEIGHT_OFFSET = 252;
+
+const tableHeightOffset = computed<number>(() => get(syncProgressHeight) + get(tableActionsHeight) + get(filtersChipsHeight) + BASE_TABLE_HEIGHT_OFFSET);
 
 const {
   anyEventsDecoding,
@@ -96,13 +102,16 @@ const {
 const usedTitle = computed<string>(() => get(sectionTitle) || t('transactions.title'));
 
 const {
+  clearFilters,
   duplicateHandlingStatus,
   fetchData,
   filters,
   groupIdentifiers,
   groupLoading,
   groups,
+  hasActiveFilters,
   highlightedIdentifiers,
+  highlightTypes,
   identifiers,
   includes,
   locationLabels,
@@ -165,6 +174,12 @@ const {
   selectionMode,
 });
 
+const debouncedProcessing = refDebounced(processing, 200);
+const { autoMatchLoading, refreshUnmatchedAssetMovements } = useUnmatchedAssetMovements();
+const { eventsModificationCounter } = storeToRefs(useHistoryStore());
+useHistoryEventNavigationConsumer(pagination, pageParams, groupLoading);
+const backgroundLoading = logicOr(debouncedProcessing, autoMatchLoading);
+
 // Handle updating available event IDs from the table
 function handleUpdateEventIds({ eventIds, groupedEvents, rawEvents }: { eventIds: number[]; groupedEvents: Record<string, HistoryEventRow[]>; rawEvents?: HistoryEventRow[] }): void {
   // Create mock event entries with just the identifiers
@@ -175,6 +190,15 @@ function handleUpdateEventIds({ eventIds, groupedEvents, rawEvents }: { eventIds
   set(groupedEventsByTxRef, groupedEvents);
   // Store the original groups data - prefer rawEvents if available, otherwise use groups.data
   set(originalGroups, rawEvents || get(groups).data);
+}
+
+function openMatchAssetMovementsDialog(): void {
+  get(dialogContainer)?.show({ type: DIALOG_TYPES.MATCH_ASSET_MOVEMENTS });
+}
+
+async function handleMovementChanged(): Promise<void> {
+  await refreshUnmatchedAssetMovements();
+  await actions.fetch.dataAndLocations();
 }
 
 // Set total matching count from groups
@@ -197,10 +221,14 @@ watchImmediate(route, async ({ query }) => {
   await router.replace({ query: {} });
 });
 
-const debouncedProcessing = refDebounced(processing, 200);
-
-watch(debouncedProcessing, async (isLoading, wasLoading) => {
+watch(backgroundLoading, async (isLoading, wasLoading) => {
   if (!isLoading && wasLoading)
+    await actions.fetch.dataAndLocations();
+});
+
+// Refresh when events are modified (e.g., from pinned sidebar matching)
+watch(eventsModificationCounter, async (current, previous) => {
+  if (props.mainPage && current > previous)
     await actions.fetch.dataAndLocations();
 });
 
@@ -208,17 +236,14 @@ watch(debouncedProcessing, async (isLoading, wasLoading) => {
 watchDebounced(route, async () => {
   await actions.refresh.all();
 }, { debounce: 500, immediate: true, once: true });
-
-function openMatchAssetMovementsDialog(): void {
-  get(dialogContainer)?.show({ type: DIALOG_TYPES.MATCH_ASSET_MOVEMENTS });
-}
 </script>
 
 <template>
   <div>
     <SyncProgressPanel
       v-if="mainPage"
-      class="-mt-6 mb-4"
+      ref="syncProgressPanel"
+      class="-mt-4 mb-4"
     />
     <TablePageLayout
       :hide-header="!mainPage"
@@ -229,12 +254,9 @@ function openMatchAssetMovementsDialog(): void {
       <template #buttons>
         <HistoryEventsViewButtons
           v-model:show-alerts="showAlerts"
-          v-model:manual-issue-check="manualIssueCheck"
           :processing="processing"
           :loading="anyEventsDecoding"
           :include-evm-events="includes.evmEvents"
-          :main-page="mainPage"
-          :section-loading="debouncedProcessing"
           @refresh="actions.refresh.all(true, $event)"
           @show:dialog="dialogContainer?.show($event)"
         />
@@ -243,9 +265,8 @@ function openMatchAssetMovementsDialog(): void {
       <div>
         <HistoryEventsAlerts
           v-model:show="showAlerts"
-          :loading="debouncedProcessing"
+          :processing="processing"
           :main-page="mainPage"
-          :manual-issue-check="manualIssueCheck"
           @open:match-asset-movements="openMatchAssetMovementsDialog()"
         />
 
@@ -254,17 +275,18 @@ function openMatchAssetMovementsDialog(): void {
             v-if="!mainPage"
             #header
           >
-            <CardTitle>
+            <div class="flex items-center gap-x-1">
               <RefreshButton
                 :disabled="refreshing"
                 :tooltip="t('transactions.refresh_tooltip')"
                 @refresh="actions.refresh.all(true)"
               />
               {{ usedTitle }}
-            </CardTitle>
+            </div>
           </template>
 
           <HistoryEventsTableActions
+            ref="tableActions"
             v-model:filters="filters"
             v-model:toggles="toggles"
             :location-labels="locationLabels"
@@ -281,23 +303,28 @@ function openMatchAssetMovementsDialog(): void {
           />
 
           <HistoryEventsFiltersChips
+            ref="filtersChips"
             :group-identifiers="groupIdentifiers"
             :duplicate-handling-status="duplicateHandlingStatus"
             @refresh="actions.fetch.dataAndLocations()"
           />
 
-          <HistoryEventsTable
+          <HistoryEventsVirtualTable
             v-model:sort="sort"
             v-model:pagination="pagination"
+            :table-height-offset="tableHeightOffset"
             :group-loading="groupLoading"
             :groups="groups"
             :page-params="toggles.matchExactEvents ? pageParams : undefined"
             :exclude-ignored="!toggles.showIgnoredAssets"
+            :has-active-filters="hasActiveFilters"
             :identifiers="identifiers"
             :highlighted-identifiers="highlightedIdentifiers"
+            :highlight-types="highlightTypes"
             :selection="selectionMode"
             :match-exact-events="toggles.matchExactEvents"
             :duplicate-handling-status="duplicateHandlingStatus"
+            @clear-filters="clearFilters()"
             @show:dialog="dialogContainer?.show($event)"
             @refresh="actions.fetch.dataAndRedecode($event)"
             @refresh:block-event="actions.redecode.blocks($event)"
@@ -316,6 +343,7 @@ function openMatchAssetMovementsDialog(): void {
           :event-handlers="actions.dialogHandlers"
           :selected-event-ids="selectedEventIds"
           @accounting-rule-refresh="handleAccountingRuleRefresh()"
+          @movement-matched="handleMovementChanged()"
         />
       </div>
     </TablePageLayout>

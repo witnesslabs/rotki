@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { HistoryEventAction } from '@/composables/history/events/types';
+import type { UnmatchedAssetMovement } from '@/composables/history/events/use-unmatched-asset-movements';
 import type { AddTransactionHashPayload } from '@/types/history/events';
 import type { AccountingRuleEntry } from '@/types/settings/accounting';
 import { get } from '@vueuse/core';
@@ -25,6 +26,7 @@ withDefaults(defineProps<{
 
 const emit = defineEmits<{
   'accounting-rule-refresh': [];
+  'movement-matched': [];
 }>();
 
 // Shared loading component for lazy-loaded dialogs
@@ -69,9 +71,21 @@ const AccountingRuleFormDialog = defineAsyncComponent({
   loadingComponent: DialogLoadingComponent,
 });
 
+const CustomizedEventDuplicatesDialog = defineAsyncComponent({
+  delay: 200,
+  loader: () => import('@/components/history/events/CustomizedEventDuplicatesDialog.vue'),
+  loadingComponent: DialogLoadingComponent,
+});
+
 const MatchAssetMovementsDialog = defineAsyncComponent({
   delay: 200,
   loader: () => import('@/components/history/events/MatchAssetMovementsDialog.vue'),
+  loadingComponent: DialogLoadingComponent,
+});
+
+const PotentialMatchesDialog = defineAsyncComponent({
+  delay: 200,
+  loader: () => import('@/components/history/events/PotentialMatchesDialog.vue'),
   loadingComponent: DialogLoadingComponent,
 });
 
@@ -125,8 +139,26 @@ const addTransactionModelValue = computed({
   },
 });
 
+const potentialMatchMovement = ref<UnmatchedAssetMovement>();
+const showPotentialMatchesDialog = ref<boolean>(false);
+
+function showPotentialMatches(movement: UnmatchedAssetMovement): void {
+  set(potentialMatchMovement, movement);
+  set(showPotentialMatchesDialog, true);
+}
+
+function onPotentialMatchMatched(): void {
+  set(potentialMatchMovement, undefined);
+  emit('movement-matched');
+}
+
+function onPotentialMatchPinned(): void {
+  set(potentialMatchMovement, undefined);
+  closeDialog();
+}
 defineExpose({
   show: managerShow,
+  showPotentialMatches,
 });
 </script>
 
@@ -185,10 +217,24 @@ defineExpose({
       @refresh="emit('accounting-rule-refresh')"
     />
 
+    <CustomizedEventDuplicatesDialog
+      v-if="currentDialog.type === DIALOG_TYPES.CUSTOMIZED_EVENT_DUPLICATES"
+      v-model="dialogIsOpen"
+    />
+
     <MatchAssetMovementsDialog
       v-if="currentDialog.type === DIALOG_TYPES.MATCH_ASSET_MOVEMENTS"
       v-model="dialogIsOpen"
       @refresh="eventHandlers.onHistoryEventSaved?.()"
+      @find-match="showPotentialMatches($event)"
+    />
+
+    <PotentialMatchesDialog
+      v-if="potentialMatchMovement && showPotentialMatchesDialog"
+      v-model="showPotentialMatchesDialog"
+      :movement="potentialMatchMovement"
+      @matched="onPotentialMatchMatched()"
+      @pinned="onPotentialMatchPinned()"
     />
   </div>
 </template>

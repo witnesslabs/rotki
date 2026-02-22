@@ -77,16 +77,15 @@ def test_exchanges_removed_api_keys(rotkehlchen_api_server_with_exchanges: APISe
             history=[AssetMovement(
                 timestamp=TimestampMS(1611426201000),
                 location=Location.COINBASE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.RECEIVE,
                 asset=A_BTC,
                 amount=ONE,
             ), AssetMovement(
                 timestamp=TimestampMS(1611426201000),
                 location=Location.COINBASE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.FEE,
                 asset=A_BTC,
                 amount=FVal('0.00001'),
-                is_fee=True,
             ), *create_swap_events(
                 timestamp=TimestampMS(1611426201001),
                 location=Location.COINBASE,
@@ -153,6 +152,69 @@ def test_exchanges_removed_api_keys(rotkehlchen_api_server_with_exchanges: APISe
     assert event6.location == Location.EXTERNAL
     assert event6.free_amount == FVal(49)
     assert event6.asset == A_LINK
+
+
+@pytest.mark.parametrize('have_decoders', [True])
+@pytest.mark.parametrize('default_mock_price_value', [FVal(1.5)])
+@pytest.mark.parametrize('ethereum_accounts', [[]])
+@pytest.mark.parametrize('added_exchanges', [[]])
+@pytest.mark.parametrize('initialize_accounting_rules', [True])
+def test_asset_movement_fee_respects_accounting_rules(
+        rotkehlchen_api_server_with_exchanges: APIServer,
+) -> None:
+    """Test that asset movement fee events respect accounting rules when present."""
+    rotki = rotkehlchen_api_server_with_exchanges.rest_api.rotkehlchen
+    fee_amount = FVal('0.00001')
+
+    with rotki.data.db.user_write() as write_cursor:
+        DBHistoryEvents(rotki.data.db).add_history_event(
+            write_cursor=write_cursor,
+            event=AssetMovement(
+                timestamp=TimestampMS(1611426201000),
+                location=Location.COINBASE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                asset=A_BTC,
+                amount=ONE,
+            ),
+        )
+        fee_event_id = DBHistoryEvents(rotki.data.db).add_history_event(
+            write_cursor=write_cursor,
+            event=AssetMovement(
+                timestamp=TimestampMS(1611426201000),
+                location=Location.COINBASE,
+                event_subtype=HistoryEventSubType.FEE,
+                asset=A_BTC,
+                amount=fee_amount,
+            ),
+        )
+
+    with suppress(InputError):
+        DBAccountingRules(rotki.data.db).add_accounting_rule(
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.FEE,
+            counterparty=None,
+            rule=BaseEventSettings(
+                taxable=False,
+                count_entire_amount_spend=False,
+                count_cost_basis_pnl=False,
+            ),
+            links={},
+            event_ids=[fee_event_id] if fee_event_id is not None else None,
+        )
+
+    _, events = accounting_create_and_process_history(
+        rotki=rotki,
+        start_ts=Timestamp(0),
+        end_ts=Timestamp(1611426233),
+    )
+    fee_events = [
+        event for event in events
+        if event.event_type == AccountingEventType.ASSET_MOVEMENT
+    ]
+    assert len(fee_events) == 1
+    fee_event = fee_events[0]
+    assert fee_event.taxable_amount == ZERO
+    assert fee_event.asset == A_BTC
 
 
 @pytest.mark.parametrize('have_decoders', [True])

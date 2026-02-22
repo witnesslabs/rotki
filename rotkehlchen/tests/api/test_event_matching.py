@@ -4,14 +4,23 @@ from unittest.mock import patch
 
 import requests
 
-from rotkehlchen.api.v1.types import TaskName
+from rotkehlchen.api.v1.types import IncludeExcludeFilterData, TaskName
+from rotkehlchen.chain.decoding.constants import CPT_GAS
+from rotkehlchen.chain.evm.decoding.aave.constants import CPT_AAVE_V3
 from rotkehlchen.constants import HOUR_IN_SECONDS
-from rotkehlchen.constants.assets import A_BTC, A_ETH, A_WETH
-from rotkehlchen.db.cache import ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE, DBCacheDynamic
+from rotkehlchen.constants.assets import A_BAT, A_BTC, A_ETH, A_WETH
+from rotkehlchen.db.constants import (
+    HISTORY_MAPPING_KEY_STATE,
+    HistoryEventLinkType,
+    HistoryMappingState,
+)
 from rotkehlchen.db.filtering import HistoryEventFilterQuery
 from rotkehlchen.db.history_events import DBHistoryEvents
 from rotkehlchen.fval import FVal
-from rotkehlchen.history.events.structures.asset_movement import AssetMovement
+from rotkehlchen.history.events.structures.asset_movement import (
+    AssetMovement,
+    AssetMovementExtraData,
+)
 from rotkehlchen.history.events.structures.base import HistoryBaseEntryType, HistoryEvent
 from rotkehlchen.history.events.structures.eth2 import EthWithdrawalEvent
 from rotkehlchen.history.events.structures.evm_event import EvmEvent
@@ -32,6 +41,32 @@ from rotkehlchen.types import Location, TimestampMS
 
 if TYPE_CHECKING:
     from rotkehlchen.api.server import APIServer
+    from rotkehlchen.history.events.structures.base import HistoryBaseEntry
+
+
+def _check_all_unlinked(
+        dbevents: 'DBHistoryEvents',
+        original_events: list['HistoryBaseEntry'],
+) -> None:
+    """Check that all asset movements are unlinked with the matched events restored
+    to their original state.
+    """
+    with dbevents.db.conn.read_ctx() as cursor:
+        # Check that all modified events have been restored to their original state and the
+        # adjustment event has been removed.
+        assert dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(
+                order_by_rules=[('history_events_identifier', True)],
+            ),
+        ) == original_events
+        # Check that no events remain in the backup table
+        assert cursor.execute('SELECT COUNT(*) FROM history_events_backup').fetchone()[0] == 0
+        # Check that the auto-matched mapping states have been removed.
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value=?',
+            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.MATCHED.serialize_for_db()),
+        ).fetchone()[0] == 0
 
 
 def test_match_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
@@ -44,7 +79,7 @@ def test_match_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
             history=[(asset_movement := AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1510000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -66,29 +101,28 @@ def test_match_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
 
     assert_simple_ok_response(requests.put(
         url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
-        json={'asset_movement': 1, 'matched_event': 2},
+        json={'asset_movement': 1, 'matched_events': [2]},
     ))
     assert asset_movement.identifier is not None
     with rotki.data.db.conn.read_ctx() as cursor:
-        assert rotki.data.db.get_dynamic_cache(
-            cursor=cursor,
-            name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-            identifier=asset_movement.identifier,
-        ) == matched_event.identifier
+        assert cursor.execute(
+            'SELECT right_event_id FROM history_event_links '
+            'WHERE left_event_id=? AND link_type=?',
+            (asset_movement.identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
+        ).fetchone()[0] == matched_event.identifier
         events = dbevents.get_history_events_internal(
             cursor=cursor,
             filter_query=HistoryEventFilterQuery.make(),
         )
 
     # Check that the matched event was properly updated
-    matched_event.event_type = HistoryEventType.DEPOSIT
-    matched_event.event_subtype = HistoryEventSubType.DEPOSIT_ASSET
+    matched_event.event_type = HistoryEventType.EXCHANGE_TRANSFER
+    matched_event.event_subtype = HistoryEventSubType.RECEIVE
     matched_event.counterparty = 'kraken'
-    matched_event.notes = f'Deposit 0.1 ETH to {user_address} from Kraken 1'
+    matched_event.notes = f'Receive 0.1 ETH in {user_address} from Kraken'
     matched_event.extra_data = {'matched_asset_movement': {
         'group_identifier': asset_movement.group_identifier,
         'exchange': 'kraken',
-        'exchange_name': 'Kraken 1',
     }}
     assert events == [asset_movement, matched_event]
 
@@ -98,7 +132,7 @@ def test_match_asset_movements_errors(rotkehlchen_api_server: 'APIServer') -> No
     assert_error_response(
         response=requests.put(
             url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
-            json={'asset_movement': 1, 'matched_event': 2},
+            json={'asset_movement': 1, 'matched_events': [2]},
         ),
         status_code=HTTPStatus.BAD_REQUEST,
         contained_in_msg='No asset movement event found in the DB for identifier 1',
@@ -113,7 +147,7 @@ def test_match_asset_movements_errors(rotkehlchen_api_server: 'APIServer') -> No
             history=[AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1510000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -124,15 +158,202 @@ def test_match_asset_movements_errors(rotkehlchen_api_server: 'APIServer') -> No
     assert_error_response(
         response=requests.put(
             url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
-            json={'asset_movement': 1, 'matched_event': 2},
+            json={'asset_movement': 1, 'matched_events': [2]},
         ),
         status_code=HTTPStatus.BAD_REQUEST,
-        contained_in_msg='No event found in the DB for identifier 2',
+        contained_in_msg='Some of the specified matched event identifiers [2] are missing from the DB.',  # noqa: E501
     )
 
 
+def test_multi_match_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
+    """Test manually matching an asset movement with multiple onchain events."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    dbevents = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        dbevents.add_history_events(
+            write_cursor=write_cursor,
+            history=(original_events := [(before_event := HistoryEvent(
+                identifier=1,
+                group_identifier='xyz1',
+                sequence_index=0,
+                location=Location.EXTERNAL,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                timestamp=TimestampMS(1500000000000),
+                asset=A_BTC,
+                amount=FVal('0.01'),
+            )), (asset_movement := AssetMovement(
+                identifier=2,
+                location=Location.KRAKEN,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1510000000000),
+                asset=A_ETH,
+                amount=FVal('0.3'),
+                unique_id='1',
+                location_label='Kraken 1',
+            )), EvmEvent(
+                identifier=3,
+                tx_ref=(tx_hash1 := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(1510000000001),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.0001'),
+                counterparty=CPT_GAS,
+                location_label=(user_address := make_evm_address()),
+            ), (matched_event1 := EvmEvent(
+                identifier=4,
+                tx_ref=tx_hash1,
+                sequence_index=1,
+                timestamp=TimestampMS(1510000000001),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.1'),
+                location_label=user_address,
+            )), EvmEvent(
+                identifier=5,
+                tx_ref=(tx_hash2 := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(1510000000002),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.0001'),
+                counterparty=CPT_GAS,
+                location_label=(user_address := make_evm_address()),
+            ), (matched_event2 := EvmEvent(
+                identifier=6,
+                tx_ref=tx_hash2,
+                sequence_index=1,
+                timestamp=TimestampMS(1510000000002),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.2'),
+                location_label=user_address,
+            )), (after_event := HistoryEvent(
+                identifier=7,
+                group_identifier='xyz2',
+                sequence_index=0,
+                location=Location.EXTERNAL,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                timestamp=TimestampMS(1510000000003),
+                asset=A_BTC,
+                amount=FVal('0.01'),
+            ))]),
+        )
+
+    assert_simple_ok_response(requests.put(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={
+            'asset_movement': asset_movement.identifier,
+            'matched_events': [matched_event1.identifier, matched_event2.identifier],
+        },
+    ))
+    with rotki.data.db.conn.read_ctx() as cursor:
+        # Check that the matched events were properly linked
+        assert cursor.execute(
+            'SELECT left_event_id, right_event_id FROM history_event_links WHERE link_type=?',
+            (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
+        ).fetchall() == [
+            (asset_movement.identifier, matched_event1.identifier),
+            (asset_movement.identifier, matched_event2.identifier),
+        ]
+        # Check that the matched events were properly updated
+        assert len(events := dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(
+                entry_types=IncludeExcludeFilterData([HistoryBaseEntryType.EVM_EVENT]),
+                event_types=[HistoryEventType.EXCHANGE_TRANSFER],
+                event_subtypes=[HistoryEventSubType.RECEIVE],
+            ),
+        )) == 2  # the two matched events
+        assert all(
+            x.extra_data is not None and 'matched_asset_movement' in x.extra_data
+            for x in events
+        )
+        assert events[0].group_identifier == matched_event1.group_identifier
+        assert events[1].group_identifier == matched_event2.group_identifier
+
+    # Check aggregating by group
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={'aggregate_by_group_ids': True},
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )['entries']
+    assert len(result) == 3  # before event + multi match group + after event
+    assert result[0]['entry']['group_identifier'] == after_event.group_identifier
+    assert result[1]['entry']['group_identifier'] == asset_movement.group_identifier
+    assert result[2]['entry']['group_identifier'] == before_event.group_identifier
+
+    # Check filtering by group_identifiers without aggregating gets the proper results for any
+    # group id in the joined group.
+    for group_identifier in [
+        asset_movement.group_identifier,
+        matched_event1.group_identifier,
+        matched_event2.group_identifier,
+    ]:
+        result = assert_proper_response_with_result(
+            response=requests.post(
+                api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+                json={'aggregate_by_group_ids': False, 'group_identifiers': [group_identifier]},
+            ),
+            rotkehlchen_api_server=rotkehlchen_api_server,
+        )['entries']
+        assert len(result) == 3  # two gas events and the matched pair sublist
+        assert all(x['entry']['group_identifier'] == asset_movement.group_identifier for x in result[:2])  # noqa: E501
+        assert result[0]['entry']['actual_group_identifier'] == matched_event1.group_identifier
+        assert result[0]['entry']['counterparty'] == CPT_GAS
+        assert result[1]['entry']['actual_group_identifier'] == matched_event2.group_identifier
+        assert result[1]['entry']['counterparty'] == CPT_GAS
+        assert len(sublist := result[2]) == 3  # movement and two matched events
+        assert all(x['entry']['group_identifier'] == asset_movement.group_identifier for x in sublist)  # noqa: E501
+        assert sublist[0]['entry']['event_type'] == HistoryEventType.EXCHANGE_TRANSFER.serialize()
+        assert sublist[0]['entry']['event_subtype'] == HistoryEventSubType.SPEND.serialize()
+        assert sublist[0]['entry']['actual_group_identifier'] == asset_movement.group_identifier
+        assert sublist[1]['entry']['event_type'] == HistoryEventType.EXCHANGE_TRANSFER.serialize()
+        assert sublist[1]['entry']['event_subtype'] == HistoryEventSubType.RECEIVE.serialize()
+        assert sublist[1]['entry']['actual_group_identifier'] == matched_event1.group_identifier
+        assert sublist[2]['entry']['event_type'] == HistoryEventType.EXCHANGE_TRANSFER.serialize()
+        assert sublist[2]['entry']['event_subtype'] == HistoryEventSubType.RECEIVE.serialize()
+        assert sublist[2]['entry']['actual_group_identifier'] == matched_event2.group_identifier
+
+    # Check that non-aggregating with no filter works properly including the surrounding events.
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={'aggregate_by_group_ids': False},
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )['entries']
+    assert len(result) == 5  # before event + two gas events + matched pair sublist + after event
+    assert result[0]['entry']['group_identifier'] == after_event.group_identifier
+    assert result[1]['entry']['actual_group_identifier'] == matched_event2.group_identifier
+    assert result[2]['entry']['actual_group_identifier'] == matched_event1.group_identifier
+    assert len(result[3]) == 3  # movement and two matched events
+    assert result[4]['entry']['group_identifier'] == before_event.group_identifier
+
+    # Check that unlinking a multi-match works properly
+    assert_simple_ok_response(requests.delete(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={'identifier': asset_movement.identifier},
+    ))
+    _check_all_unlinked(dbevents=dbevents, original_events=original_events)
+
+
 def test_mark_asset_movement_no_match(rotkehlchen_api_server: 'APIServer') -> None:
-    """Test that marking an asset movement as not matching works as expected."""
+    """Test that marking an asset movement as not matching works as expected, and also that
+    this ignored movement can also be converted to a matched pair properly.
+    """
     rotki = rotkehlchen_api_server.rest_api.rotkehlchen
     dbevents = DBHistoryEvents(rotki.data.db)
     with rotki.data.db.conn.write_ctx() as write_cursor:
@@ -141,12 +362,22 @@ def test_mark_asset_movement_no_match(rotkehlchen_api_server: 'APIServer') -> No
             history=[(asset_movement := AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1500000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
                 unique_id='1',
-            ))],
+            )), HistoryEvent(
+                identifier=(matched_event_id := 2),
+                group_identifier='xyz',
+                sequence_index=0,
+                location=Location.EXTERNAL,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                timestamp=TimestampMS(1510000000001),
+                asset=A_ETH,
+                amount=FVal('0.01'),
+            )],
         )
 
     movements, _ = get_unmatched_asset_movements(database=rotki.data.db)
@@ -158,14 +389,30 @@ def test_mark_asset_movement_no_match(rotkehlchen_api_server: 'APIServer') -> No
     ))
 
     with rotki.data.db.conn.read_ctx() as cursor:
-        assert rotki.data.db.get_dynamic_cache(
-            cursor=cursor,
-            name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-            identifier=asset_movement.identifier,
-        ) == ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM history_event_link_ignores '
+            'WHERE event_id=? AND link_type=?',
+            (asset_movement.identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
+        ).fetchone()[0] == 1
 
     movements, _ = get_unmatched_asset_movements(database=rotki.data.db)
     assert len(movements) == 0
+
+    # Also check that converting from an ignored movement to matched pair works properly
+    assert_simple_ok_response(requests.put(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={'asset_movement': asset_movement.identifier, 'matched_events': [matched_event_id]},
+    ))
+    with rotki.data.db.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM history_event_link_ignores '
+            'WHERE event_id=? AND link_type=?',
+            (asset_movement.identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
+        ).fetchone()[0] == 0
+        assert cursor.execute(
+            'SELECT left_event_id, right_event_id FROM history_event_links WHERE link_type=?',
+            (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
+        ).fetchall() == [(asset_movement.identifier, matched_event_id)]
 
 
 def test_unlink_matched_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
@@ -175,10 +422,10 @@ def test_unlink_matched_asset_movements(rotkehlchen_api_server: 'APIServer') -> 
     with rotki.data.db.conn.write_ctx() as write_cursor:
         dbevents.add_history_events(
             write_cursor=write_cursor,
-            history=[(movement1 := AssetMovement(
+            history=(original_events := [(movement1 := AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1500000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -186,65 +433,107 @@ def test_unlink_matched_asset_movements(rotkehlchen_api_server: 'APIServer') -> 
             )), (movement2 := AssetMovement(
                 identifier=2,
                 location=Location.BINANCE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.RECEIVE,
                 timestamp=movement1.timestamp,
                 asset=movement1.asset,
-                amount=movement1.amount,
+                amount=movement1.amount + FVal('0.0001'),  # different amount - will make an adjustment event.  # noqa: E501
                 unique_id='2',
             )), (movement3 := AssetMovement(
                 identifier=3,
                 location=Location.BITSTAMP,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1600000000000),
                 asset=A_ETH,
                 amount=FVal('0.5'),
                 unique_id='3',
-            )), (movement3_match := HistoryEvent(
+            )), (movement3_match := EvmEvent(
                 identifier=4,
-                group_identifier='xyz',
+                tx_ref=make_evm_tx_hash(),
                 sequence_index=0,
                 timestamp=movement3.timestamp,
                 event_type=HistoryEventType.RECEIVE,
                 event_subtype=HistoryEventSubType.NONE,
-                location=Location.EXTERNAL,
+                location=Location.ETHEREUM,
                 asset=movement3.asset,
                 amount=movement3.amount,
             )), (movement4 := AssetMovement(
                 identifier=5,
                 location=Location.COINBASE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.RECEIVE,
                 timestamp=TimestampMS(1700000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
                 unique_id='4',
-            ))],
+            ))]),
         )
 
     match_asset_movements(database=rotki.data.db)
 
-    for method, movement, expected_cache in [
-        ('put', movement4, [  # First mark movement4 as having no match. All movements should have an entry in the cache.  # noqa: E501
-            (f'matched_asset_movement_{movement3.identifier}', str(movement3_match.identifier)),
-            (f'matched_asset_movement_{movement1.identifier}', str(movement2.identifier)),
-            (f'matched_asset_movement_{movement2.identifier}', str(movement1.identifier)),
-            (f'matched_asset_movement_{movement4.identifier}', str(ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE)),  # noqa: E501
-        ]), ('delete', movement1, [  # unlink movement1
-            (f'matched_asset_movement_{movement3.identifier}', str(movement3_match.identifier)),
-            (f'matched_asset_movement_{movement4.identifier}', str(ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE)),  # noqa: E501
-        ]), ('delete', movement3, [  # unlink movement3
-            (f'matched_asset_movement_{movement4.identifier}', str(ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE)),  # noqa: E501
-        ]), ('delete', movement4, []),  # unlink movement4 (removes the "no match" value)
+    with rotki.data.db.conn.read_ctx() as cursor:
+        # Check that we have backups of the three matched events (movement3_match,
+        # and both movement1 and movement2 since they are the matches for eachother).
+        assert cursor.execute('SELECT group_identifier FROM history_events_backup').fetchall() == [
+            (movement2.group_identifier,),
+            (movement3_match.group_identifier,),
+            (movement1.group_identifier,),
+        ]
+        # Check that we have an exchange adjustment event.
+        assert len(dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(
+                event_types=[HistoryEventType.EXCHANGE_ADJUSTMENT],
+            ),
+        )) == 1
+        # Check that the auto-matched mapping states have been set.
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value=?',
+            (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.MATCHED.serialize_for_db()),
+        ).fetchone()[0] == 4  # 3 matched events + 1 adjustment event
+
+    for method, key, value, expected_links, expected_ignored in [
+        (  # First mark movement4 as having no match.
+            'put',
+            'asset_movement',
+            movement4.identifier,
+            [
+                (movement3.identifier, movement3_match.identifier),
+                (movement1.identifier, movement2.identifier),
+                (movement2.identifier, movement1.identifier),
+            ],
+            [movement4.identifier],
+        ),
+        ('delete', 'identifier', movement1.identifier, [  # unlink movement1
+            (movement3.identifier, movement3_match.identifier),
+        ], [movement4.identifier]),
+        # unlink movement3 via its match's identifier
+        ('delete', 'identifier', movement3_match.identifier, [], [movement4.identifier]),
+        ('delete', 'identifier', movement4.identifier, [], []),  # unlink movement4 ignore
     ]:
         assert_simple_ok_response(requests.request(
             method=method,
             url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
-            json={'asset_movement': movement.identifier},
+            json={key: value},
         ))
         with rotki.data.db.conn.read_ctx() as cursor:
-            assert cursor.execute(
-                'SELECT * FROM key_value_cache WHERE name LIKE ?',
-                (f'{DBCacheDynamic.MATCHED_ASSET_MOVEMENT.name.lower()}%',),
-            ).fetchall() == expected_cache
+            assert set(cursor.execute(
+                'SELECT left_event_id, right_event_id FROM history_event_links WHERE link_type=?',
+                (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
+            ).fetchall()) == set(expected_links)
+            assert set(cursor.execute(
+                'SELECT event_id FROM history_event_link_ignores WHERE link_type=?',
+                (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
+            ).fetchall()) == {(identifier,) for identifier in expected_ignored}
+
+    _check_all_unlinked(dbevents=dbevents, original_events=original_events)
+
+    # Re-link after unlinking should not fail due to duplicated key_value_cache entries.
+    assert_simple_ok_response(requests.put(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={
+            'asset_movement': movement3.identifier,
+            'matched_events': [movement3_match.identifier],
+        },
+    ))
 
 
 def test_get_unmatched_asset_movements(rotkehlchen_api_server: 'APIServer') -> None:
@@ -257,7 +546,7 @@ def test_get_unmatched_asset_movements(rotkehlchen_api_server: 'APIServer') -> N
             history=[(matched_movement := AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1510000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -265,7 +554,7 @@ def test_get_unmatched_asset_movements(rotkehlchen_api_server: 'APIServer') -> N
             )), (unmatched_movement := AssetMovement(
                 identifier=2,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1510000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -273,26 +562,37 @@ def test_get_unmatched_asset_movements(rotkehlchen_api_server: 'APIServer') -> N
             )), (no_match_movement := AssetMovement(
                 identifier=3,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1510000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
                 unique_id='3',
-            ))],
+            )), HistoryEvent(
+                identifier=(match_identifier := 4),
+                group_identifier='dummy',
+                sequence_index=0,
+                timestamp=TimestampMS(1510000000000),
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                location=Location.EXTERNAL,
+                asset=A_ETH,
+                amount=FVal('0.1'),
+            )],
         )
         assert matched_movement.identifier is not None
         assert no_match_movement.identifier is not None
-        rotki.data.db.set_dynamic_cache(
-            write_cursor=write_cursor,
-            name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-            identifier=matched_movement.identifier,
-            value=5,  # matched event identifier can be anything here
+        write_cursor.execute(
+            'INSERT INTO history_event_links(left_event_id, right_event_id, link_type) '
+            'VALUES(?, ?, ?)',
+            (
+                matched_movement.identifier,
+                match_identifier,
+                HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
+            ),
         )
-        rotki.data.db.set_dynamic_cache(
-            write_cursor=write_cursor,
-            name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-            identifier=no_match_movement.identifier,
-            value=ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE,
+        write_cursor.execute(
+            'INSERT INTO history_event_link_ignores(event_id, link_type) VALUES(?, ?)',
+            (no_match_movement.identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
         )
 
     result = assert_proper_response_with_result(
@@ -311,6 +611,55 @@ def test_get_unmatched_asset_movements(rotkehlchen_api_server: 'APIServer') -> N
     assert result == [no_match_movement.group_identifier]
 
 
+def test_get_unmatched_excludes_right_match(
+        rotkehlchen_api_server: 'APIServer',
+) -> None:
+    """
+    Regression: right-side matches were still returned because only left_event_id was checked.
+    """
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    dbevents = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        dbevents.add_history_events(
+            write_cursor=write_cursor,
+            history=[(left_movement := AssetMovement(
+                identifier=1,
+                location=Location.KRAKEN,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1510000000000),
+                asset=A_ETH,
+                amount=FVal('0.1'),
+                unique_id='1',
+            )), (right_movement := AssetMovement(
+                identifier=2,
+                location=Location.BINANCE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                timestamp=TimestampMS(1510000000001),
+                asset=A_ETH,
+                amount=FVal('0.1'),
+                unique_id='2',
+            ))],
+        )
+
+    assert set(assert_proper_response_with_result(
+        response=requests.get(api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource')),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )) == {left_movement.group_identifier, right_movement.group_identifier}
+
+    assert_simple_ok_response(requests.put(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={
+            'asset_movement': left_movement.identifier,
+            'matched_events': [right_movement.identifier],
+        },
+    ))
+
+    assert assert_proper_response_with_result(
+        response=requests.get(api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource')),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    ) == []
+
+
 def test_get_possible_matches(rotkehlchen_api_server: 'APIServer') -> None:
     """Test getting possible matches for an asset movement"""
     rotki = rotkehlchen_api_server.rest_api.rotkehlchen
@@ -319,7 +668,7 @@ def test_get_possible_matches(rotkehlchen_api_server: 'APIServer') -> None:
     matched_movement = AssetMovement(
         identifier=1,
         location=Location.KRAKEN,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.SPEND,
         timestamp=TimestampMS(1510000000000),
         asset=A_ETH,
         amount=FVal('0.1'),
@@ -404,6 +753,94 @@ def test_get_possible_matches(rotkehlchen_api_server: 'APIServer') -> None:
             'other_events': expected_other_events,
         }
 
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        for idx, value in enumerate(already_matched_ids := [5, 3]):
+            link_left_id = dbevents.add_history_event(
+                write_cursor=write_cursor,
+                event=AssetMovement(
+                    group_identifier=f'dummy-{idx}',
+                    timestamp=matched_movement.timestamp,
+                    event_subtype=HistoryEventSubType.RECEIVE,
+                    location=Location.EXTERNAL,
+                    asset=A_ETH,
+                    amount=FVal('0.1'),
+                ),
+            )
+            assert link_left_id is not None
+            write_cursor.execute(
+                'INSERT INTO history_event_links(left_event_id, right_event_id, link_type) '
+                'VALUES(?, ?, ?)',
+                (
+                    link_left_id,  # simulate matching with some other movement's id
+                    value,
+                    HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
+                ),
+            )
+
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+            json={
+                'asset_movement': matched_movement.group_identifier,
+                'time_range': HOUR_IN_SECONDS * 2,
+                'tolerance': '0.002',
+            },
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    for already_matched_id in already_matched_ids:
+        assert already_matched_id not in result['close_matches']
+        assert already_matched_id not in result['other_events']
+
+
+def test_protocol_counterparty_in_other_events_only(
+        rotkehlchen_api_server: 'APIServer',
+) -> None:
+    """Protocol counterparty events should not appear in close_matches (which mirrors
+    auto-matching) but should be included in other_events for manual matching."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    dbevents = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        dbevents.add_history_events(
+            write_cursor=write_cursor,
+            history=[movement := AssetMovement(
+                identifier=1,
+                location=Location.KRAKEN,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                timestamp=TimestampMS(1700003101000),
+                asset=A_ETH,
+                amount=FVal('1'),
+                unique_id='kraken_deposit_1',
+                location_label='Kraken 1',
+            ), EvmEvent(
+                identifier=2,
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1700003100000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+                asset=A_ETH,
+                amount=FVal('1'),
+                counterparty=CPT_AAVE_V3,
+                location_label=make_evm_address(),
+            )],
+        )
+
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+            json={
+                'asset_movement': movement.group_identifier,
+                'time_range': HOUR_IN_SECONDS,
+                'tolerance': '0.002',
+            },
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert result['close_matches'] == []
+    assert result['other_events'] == [2]
+
 
 def test_get_history_events_with_matched_asset_movements(
         rotkehlchen_api_server: 'APIServer',
@@ -422,7 +859,7 @@ def test_get_history_events_with_matched_asset_movements(
             history=[(movement1 := AssetMovement(
                 identifier=1,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.SPEND,
                 timestamp=TimestampMS(1500000000000),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -430,16 +867,15 @@ def test_get_history_events_with_matched_asset_movements(
             )), AssetMovement(
                 identifier=2,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.FEE,
                 timestamp=movement1.timestamp,
                 asset=A_ETH,
                 amount=FVal('0.001'),
-                is_fee=True,
                 unique_id='1',
             ), (movement2 := AssetMovement(
                 identifier=3,
                 location=Location.BINANCE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.RECEIVE,
                 timestamp=TimestampMS(1500000000001),
                 asset=A_ETH,
                 amount=FVal('0.1'),
@@ -447,17 +883,16 @@ def test_get_history_events_with_matched_asset_movements(
             )), AssetMovement(
                 identifier=4,
                 location=Location.BINANCE,
-                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.FEE,
                 timestamp=movement2.timestamp,
                 asset=A_ETH,
                 amount=FVal('0.001'),
-                is_fee=True,
                 unique_id='2',
             ), (movement3 := AssetMovement(
                 identifier=5,
                 location=Location.KRAKEN,
-                event_type=HistoryEventType.WITHDRAWAL,
-                timestamp=TimestampMS(1500000000002),
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1500000000003),
                 asset=A_ETH,
                 amount=FVal('0.5'),
                 unique_id='3',
@@ -489,6 +924,8 @@ def test_get_history_events_with_matched_asset_movements(
     match_asset_movements(database=rotki.data.db)
 
     # Check aggregating by group with several filters that should all get the same groups.
+    # Also check that the group with an evm event returns only the associated asset movement
+    # even when the group_identifier specified is for the evm event.
     for filters in (
         {},
         {'entry_types': {'values': [HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.serialize()]}},
@@ -505,7 +942,8 @@ def test_get_history_events_with_matched_asset_movements(
         assert result['entries_found'] == result['entries_found_total'] == result['entries_total'] == 2  # noqa: E501
         assert len(result['entries']) == 2
         assert result['entries'][0]['grouped_events_num'] == 3  # includes both evm events and the matched asset movement  # noqa: E501
-        assert result['entries'][0]['entry']['group_identifier'] == evm_event_1.group_identifier
+        assert result['entries'][0]['entry']['group_identifier'] == movement3.group_identifier
+        assert result['entries'][0]['entry']['entry_type'] == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.serialize()  # noqa: E501
         assert result['entries'][1]['grouped_events_num'] == 4  # the two matched movements and their fees  # noqa: E501
         assert result['entries'][1]['entry']['group_identifier'] == movement1.group_identifier
 
@@ -527,16 +965,18 @@ def test_get_history_events_with_matched_asset_movements(
     assert len(result) == 2
     # The first event in the tx isn't related to the asset movement
     assert (unrelated_event_entry := result[0])['entry']['event_type'] == 'spend'
-    assert unrelated_event_entry['entry']['group_identifier'] == evm_event_1.group_identifier
+    assert unrelated_event_entry['entry']['group_identifier'] == movement3.group_identifier
     assert unrelated_event_entry['entry']['actual_group_identifier'] == evm_event_1.group_identifier  # noqa: E501
     # matched events are in a sublist so frontend can easily group them
     assert len(match1_sublist := result[1]) == 2
-    assert match1_sublist[0]['entry']['event_type'] == 'deposit'
-    assert match1_sublist[0]['entry']['group_identifier'] == evm_event_1.group_identifier
-    assert match1_sublist[0]['entry']['actual_group_identifier'] == evm_event_1.group_identifier
-    assert match1_sublist[1]['entry']['event_type'] == 'withdrawal'
-    assert match1_sublist[1]['entry']['group_identifier'] == evm_event_1.group_identifier
-    assert match1_sublist[1]['entry']['actual_group_identifier'] == movement3.group_identifier
+    assert match1_sublist[0]['entry']['event_type'] == 'exchange transfer'
+    assert match1_sublist[0]['entry']['event_subtype'] == 'spend'
+    assert match1_sublist[0]['entry']['group_identifier'] == movement3.group_identifier
+    assert match1_sublist[0]['entry']['actual_group_identifier'] == movement3.group_identifier
+    assert match1_sublist[1]['entry']['event_type'] == 'exchange transfer'
+    assert match1_sublist[1]['entry']['event_subtype'] == 'receive'
+    assert match1_sublist[1]['entry']['group_identifier'] == movement3.group_identifier
+    assert match1_sublist[1]['entry']['actual_group_identifier'] == evm_event_1.group_identifier
 
     # Then check the events for the second matched event (movement2)
     result = assert_proper_response_with_result(
@@ -549,14 +989,16 @@ def test_get_history_events_with_matched_asset_movements(
     assert len(result) == 1
     assert len(match2_sublist := result[0]) == 4
     assert all(x['entry']['group_identifier'] == movement1.group_identifier for x in match2_sublist)  # noqa: E501
-    assert match2_sublist[0]['entry']['event_type'] == 'deposit'
-    assert match2_sublist[0]['entry']['actual_group_identifier'] == movement2.group_identifier
+    assert match2_sublist[0]['entry']['event_type'] == 'exchange transfer'
+    assert match2_sublist[0]['entry']['event_subtype'] == 'spend'
+    assert match2_sublist[0]['entry']['actual_group_identifier'] == movement1.group_identifier
     assert match2_sublist[1]['entry']['event_subtype'] == 'fee'
-    assert match2_sublist[1]['entry']['actual_group_identifier'] == movement2.group_identifier
-    assert match2_sublist[2]['entry']['event_type'] == 'withdrawal'
-    assert match2_sublist[2]['entry']['actual_group_identifier'] == movement1.group_identifier
+    assert match2_sublist[1]['entry']['actual_group_identifier'] == movement1.group_identifier
+    assert match2_sublist[2]['entry']['event_type'] == 'exchange transfer'
+    assert match2_sublist[2]['entry']['event_subtype'] == 'receive'
+    assert match2_sublist[2]['entry']['actual_group_identifier'] == movement2.group_identifier
     assert match2_sublist[3]['entry']['event_subtype'] == 'fee'
-    assert match2_sublist[3]['entry']['actual_group_identifier'] == movement1.group_identifier
+    assert match2_sublist[3]['entry']['actual_group_identifier'] == movement2.group_identifier
 
     # Check that querying both groups at once works correctly
     assert assert_proper_response_with_result(
@@ -569,6 +1011,298 @@ def test_get_history_events_with_matched_asset_movements(
         ),
         rotkehlchen_api_server=rotkehlchen_api_server,
     )['entries'] == [unrelated_event_entry, match1_sublist, match2_sublist]
+
+
+def test_coinbase_chain_two_groups(
+        rotkehlchen_api_server: 'APIServer',
+) -> None:
+    """Regression reproducer for Coinbase/CoinbasePro/EVM chain grouping with ignores."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    dbevents = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        dbevents.add_history_events(
+            write_cursor=write_cursor,
+            history=[(coinbase_deposit := AssetMovement(
+                identifier=1,  # oldest
+                location=Location.COINBASE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                timestamp=TimestampMS(1700000000000),
+                asset=A_BAT,
+                amount=FVal('5.49'),
+                unique_id='cb_deposit_1',
+                location_label='Coinbase 1',
+                notes='Transfer funds from CoinbasePro',
+            )), (coinbasepro_withdrawal := AssetMovement(
+                identifier=2,
+                location=Location.COINBASEPRO,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1700000001000),
+                asset=A_BAT,
+                amount=FVal('5.49'),
+                unique_id='cbpro_withdrawal_1',
+                location_label='Coinbase Pro 1',
+                notes='Withdraw 5.49 from Coinbase Pro',
+                extra_data=AssetMovementExtraData(
+                    transaction_id=str(tx_hash := make_evm_tx_hash()),
+                    address=make_evm_address(),
+                ),
+            )), (coinbase_withdrawal := AssetMovement(
+                identifier=3,
+                location=Location.COINBASE,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1700000002000),
+                asset=A_BAT,
+                amount=FVal('5.49'),
+                unique_id='cb_withdrawal_1',
+                location_label='Coinbase 1',
+                notes='Withdraw 5.49 BAT from Coinbase',
+                extra_data=AssetMovementExtraData(
+                    transaction_id=str(tx_hash)[2:],  # same hash but without 0x prefix
+                    address=make_evm_address(),
+                ),
+            )), (evm_receive := EvmEvent(
+                identifier=4,  # newest
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(1700000003000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BAT,
+                amount=FVal('5.49'),
+                location_label=make_evm_address(),
+            ))],
+        )
+
+    match_asset_movements(database=rotki.data.db)
+
+    with rotki.data.db.conn.read_ctx() as cursor:
+        links = cursor.execute(
+            'SELECT left_event_id, right_event_id FROM history_event_links WHERE link_type=?',
+            (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
+        ).fetchall()
+
+    assert coinbase_deposit.identifier is not None
+    assert coinbasepro_withdrawal.identifier is not None
+    assert coinbase_withdrawal.identifier is not None
+    assert evm_receive.identifier is not None
+    logical_matches = {tuple(sorted(link)) for link in links}
+    assert logical_matches == {
+        tuple(sorted((coinbase_withdrawal.identifier, evm_receive.identifier))),
+    }
+
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={
+                'aggregate_by_group_ids': True,
+                'group_identifiers': [
+                    coinbase_deposit.group_identifier,
+                    coinbasepro_withdrawal.group_identifier,
+                    coinbase_withdrawal.group_identifier,
+                    evm_receive.group_identifier,
+                ],
+            },
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert result['entries_found'] == 3
+    assert len(result['entries']) == 3
+
+
+def test_group_header_event(rotkehlchen_api_server: 'APIServer') -> None:
+    """Test that we get the asset movement as the header event even when filtering for an
+    adjustment event or an evm event in the same tx other than the matched event.
+    """
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    events_db = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        events_db.add_history_events(
+            write_cursor=write_cursor,
+            history=[(movement_event := AssetMovement(
+                identifier=1,
+                location=Location.KRAKEN,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1520000000000),
+                asset=A_BTC,
+                amount=FVal('0.2'),
+                unique_id='xyz',
+                location_label='Kraken 1',
+            )), EvmEvent(
+                identifier=(other_evm_event_id := 2),
+                tx_ref=(tx_hash := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=movement_event.timestamp,
+                location=Location.ARBITRUM_ONE,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.001'),
+                location_label=make_evm_address(),
+            ), EvmEvent(
+                identifier=3,
+                tx_ref=tx_hash,
+                sequence_index=1,
+                timestamp=movement_event.timestamp,
+                location=Location.ARBITRUM_ONE,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=movement_event.asset,
+                amount=FVal('0.19999'),
+                location_label=make_evm_address(),
+            )],
+        )
+
+    match_asset_movements(database=rotki.data.db)
+    with rotki.data.db.conn.read_ctx() as cursor:
+        assert len(events_db.get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(
+                event_types=[HistoryEventType.EXCHANGE_ADJUSTMENT],
+            ),
+        )) == 1
+
+    for filters in (
+        {'event_types': [HistoryEventType.EXCHANGE_ADJUSTMENT.serialize()]},
+        {'identifiers': [other_evm_event_id]},
+    ):
+        assert len(result := assert_proper_response_with_result(
+            response=requests.post(
+                api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+                json={**filters, 'aggregate_by_group_ids': True},
+            ),
+            rotkehlchen_api_server=rotkehlchen_api_server,
+        )['entries']) == 1
+        assert result[0]['entry']['entry_type'] == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.serialize()  # noqa: E501
+
+    # Also verify the non-aggregated view: the adjustment event should appear inside the matched
+    # group sublist, not as a standalone entry.
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={'aggregate_by_group_ids': False},
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )['entries']
+    assert len(result) == 2  # other evm event + matched group sublist
+    sublists = [entry for entry in result if isinstance(entry, list)]
+    assert len(sublists) == 1
+    sublist = sublists[0]
+    assert len(sublist) == 3  # movement + matched event + adjustment
+    assert any(
+        x['entry']['event_type'] == HistoryEventType.EXCHANGE_ADJUSTMENT.serialize()
+        for x in sublist
+    )
+
+
+def test_get_history_events_with_matched_asset_movements_pagination_no_duplicates(
+        rotkehlchen_api_server: 'APIServer',
+) -> None:
+    """Regression test for matched movement groups duplicating across adjacent pages.
+
+    The non-movement side of matched groups is excluded at the SQL level via a conditional
+    NOT IN subquery so each matched pair occupies a single pagination slot. Tests that:
+    - paginating one-by-one never produces duplicate groups
+    - entries_found reflects logical groups (matched pairs count as one)
+    - filtering by a location that only the non-movement side matches still shows results
+    - filtering by a location that only the movement side matches works correctly
+    """
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    dbevents = DBHistoryEvents(rotki.data.db)
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        dbevents.add_history_events(
+            write_cursor=write_cursor,
+            history=[(movement := AssetMovement(
+                identifier=1,
+                location=Location.KRAKEN,
+                event_subtype=HistoryEventSubType.SPEND,
+                timestamp=TimestampMS(1500000000000),
+                asset=A_ETH,
+                amount=FVal('0.1'),
+                unique_id='1',
+                location_label='Kraken 1',
+            )), (matched_event := EvmEvent(
+                identifier=2,
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1500000000002),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('0.1'),
+                location_label=make_evm_address(),
+            )), (older_event := HistoryEvent(
+                identifier=3,
+                group_identifier='older_group',
+                sequence_index=0,
+                location=Location.EXTERNAL,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                timestamp=TimestampMS(1500000000000 - HOUR_IN_MILLISECONDS),
+                asset=A_BTC,
+                amount=FVal('0.01'),
+            )), HistoryEvent(
+                identifier=4,
+                group_identifier='oldest_group',
+                sequence_index=0,
+                location=Location.EXTERNAL,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                timestamp=TimestampMS(1500000000000 - 2 * HOUR_IN_MILLISECONDS),
+                asset=A_BTC,
+                amount=FVal('0.02'),
+            )],
+        )
+
+    assert_simple_ok_response(requests.put(
+        url=api_url_for(rotkehlchen_api_server, 'matchassetmovementsresource'),
+        json={'asset_movement': movement.identifier, 'matched_events': [matched_event.identifier]},
+    ))
+
+    # 4 events / 4 SQL groups, but 3 logical groups (matched pair = 1).
+    # Paginate one-by-one: entries_found must be 3 on every page with no duplicates.
+    all_group_ids: list[str] = []
+    for offset in range(3):
+        result = assert_proper_response_with_result(
+            response=requests.post(
+                api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+                json={'aggregate_by_group_ids': True, 'limit': 1, 'offset': offset},
+            ),
+            rotkehlchen_api_server=rotkehlchen_api_server,
+        )
+        assert result['entries_found'] == 3, f'wrong entries_found at offset={offset}'
+        assert len(result['entries']) == 1, f'wrong page size at offset={offset}'
+        all_group_ids.append(result['entries'][0]['entry']['group_identifier'])
+
+    assert len(all_group_ids) == len(set(all_group_ids)), 'duplicate groups across pages'
+    assert all_group_ids[0] == movement.group_identifier
+    assert all_group_ids[1] == older_event.group_identifier
+
+    # Filter by location=ethereum. The movement (location=kraken) doesn't pass the filter,
+    # so the EvmEvent side must NOT be excluded. It stays visible as the entry point.
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={'aggregate_by_group_ids': True, 'location': Location.ETHEREUM.serialize()},
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert result['entries_found'] == 1
+    assert len(result['entries']) == 1
+    assert result['entries'][0]['entry']['group_identifier'] == movement.group_identifier
+
+    # Filter by location=kraken. The movement matches, so the EvmEvent side IS excluded.
+    result = assert_proper_response_with_result(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'historyeventresource'),
+            json={'aggregate_by_group_ids': True, 'location': Location.KRAKEN.serialize()},
+        ),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert result['entries_found'] == 1
+    assert len(result['entries']) == 1
+    assert result['entries'][0]['entry']['group_identifier'] == movement.group_identifier
 
 
 def test_trigger_matching_task(rotkehlchen_api_server: 'APIServer') -> None:
@@ -595,3 +1329,19 @@ def test_trigger_matching_task(rotkehlchen_api_server: 'APIServer') -> None:
             assert_simple_ok_response(response)
 
         assert match_mock.call_count == 1
+
+
+def test_scheduler_endpoint(rotkehlchen_api_server: 'APIServer') -> None:
+    """Test that the scheduler endpoint can enable and disable the task scheduler."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    assert rotki.task_manager is not None
+
+    for enabled in (True, False):
+        assert assert_proper_response_with_result(
+            response=requests.put(
+                api_url_for(rotkehlchen_api_server, 'schedulerresource'),
+                json={'enabled': enabled},
+            ),
+            rotkehlchen_api_server=rotkehlchen_api_server,
+        ) == {'enabled': enabled}
+        assert rotki.task_manager.should_schedule is enabled

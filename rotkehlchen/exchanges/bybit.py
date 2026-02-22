@@ -34,7 +34,7 @@ from rotkehlchen.history.events.structures.swap import (
     deserialize_trade_type_is_buy,
     get_swap_spend_receive,
 )
-from rotkehlchen.history.events.structures.types import HistoryEventType
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
 from rotkehlchen.history.events.utils import create_group_identifier_from_unique_id
 from rotkehlchen.inquirer import Inquirer
 from rotkehlchen.logging import RotkehlchenLogsAdapter
@@ -297,12 +297,15 @@ class Bybit(ExchangeInterface, SignatureGeneratorMixin):
         query_options = options.copy()
         while True:
             output = self._api_query(path=endpoint, options=query_options)
-            if (next_cursor := output.get('nextPageCursor')) is not None and len(next_cursor) != 0:
-                query_options['cursor'] = next_cursor
-
             result.extend(output[result_key])
-            if len(output[result_key]) < query_options.get(result_key, PAGINATION_LIMIT):
+            next_cursor = output.get('nextPageCursor')
+            if (
+                len(output[result_key]) < int(query_options.get('limit', PAGINATION_LIMIT)) or
+                not next_cursor
+            ):
                 break
+
+            query_options['cursor'] = next_cursor
 
         return result
 
@@ -559,11 +562,13 @@ class Bybit(ExchangeInterface, SignatureGeneratorMixin):
             timestamp_key = 'successAt'
             fee_key = 'depositFee'
             id_key = 'txID'
+            movement_subtype: Literal[HistoryEventSubType.RECEIVE, HistoryEventSubType.SPEND] = HistoryEventSubType.RECEIVE  # noqa: E501
         else:
             endpoint = 'asset/withdraw/query-record'
             timestamp_key = 'updateTime'
             fee_key = 'withdrawFee'
             id_key = 'withdrawId'
+            movement_subtype = HistoryEventSubType.SPEND
 
         raw_data = self._paginated_api_query(
             endpoint=endpoint,  # type: ignore  # mypy doesn't detect that the string is assigned once
@@ -590,7 +595,7 @@ class Bybit(ExchangeInterface, SignatureGeneratorMixin):
                     timestamp=ts_sec_to_ms(timestamp),
                     location=Location.BYBIT,
                     location_label=self.name,
-                    event_type=query_for,
+                    event_subtype=movement_subtype,
                     asset=coin,
                     amount=deserialize_fval(movement['amount']),
                     fee=AssetAmount(

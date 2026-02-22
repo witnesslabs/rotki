@@ -3,21 +3,23 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from flask import Response, send_file
-from pysqlcipher3 import dbapi2 as sqlcipher
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.accounting.constants import EVENT_GROUPING_ORDER
 from rotkehlchen.accounting.debugimporter.json import DebugHistoryImporter
 from rotkehlchen.accounting.export.csv import CSVWriteError, dict_to_csv_file
+from rotkehlchen.accounting.export.report import export_pnl_report_csv_from_db
 from rotkehlchen.accounting.pot import AccountingPot
 from rotkehlchen.api.rest_helpers.downloads import register_post_download_cleanup
 from rotkehlchen.chain.ethereum.constants import CPT_KRAKEN
 from rotkehlchen.chain.evm.accounting.aggregator import EVMAccountingAggregators
+from rotkehlchen.chain.structures import TimestampOrBlockRange
 from rotkehlchen.constants import HOUR_IN_SECONDS, ZERO
 from rotkehlchen.db.accounting_rules import query_missing_accounting_rules
 from rotkehlchen.db.evmtx import DBEvmTx
@@ -27,6 +29,7 @@ from rotkehlchen.db.filtering import (
     IncludeExcludeFilterData,
 )
 from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.db.utils import get_query_chunks
 from rotkehlchen.errors.misc import AccountingError, RemoteError
 from rotkehlchen.errors.serialization import DeserializationError
 from rotkehlchen.exchanges.constants import SUPPORTED_EXCHANGES
@@ -45,6 +48,7 @@ from rotkehlchen.premium.premium import UserLimitType, get_user_limit, has_premi
 from rotkehlchen.types import (
     EVM_CHAIN_IDS_WITH_TRANSACTIONS,
     EVM_CHAINS_WITH_TRANSACTIONS,
+    ChecksumEvmAddress,
     HistoryEventQueryType,
     Location,
     Timestamp,
@@ -58,14 +62,34 @@ if TYPE_CHECKING:
         MissingPrice,
     )
     from rotkehlchen.assets.asset import Asset
+    from rotkehlchen.chain.ethereum.modules.eth2.eth2 import Eth2
     from rotkehlchen.db.constants import HistoryMappingState
+    from rotkehlchen.db.drivers.gevent import DBCursor
     from rotkehlchen.db.filtering import HistoryBaseEntryFilterQuery
+    from rotkehlchen.db.history_events import HistoryEventsWithCountResult
     from rotkehlchen.fval import FVal
     from rotkehlchen.history.events.structures.base import HistoryBaseEntry
     from rotkehlchen.rotkehlchen import Rotkehlchen
 
 logger = logging.getLogger(__name__)
 log = RotkehlchenLogsAdapter(logger)
+
+
+def _sort_matched_group(matched_events_group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sorts a joined matched events sublist placing the withdrawals before the deposits,
+    including properly placing any associated fee events with their movements.
+    """
+    try:
+        serialized_type = HistoryEventType.EXCHANGE_TRANSFER.serialize()
+        serialized_subtype = HistoryEventSubType.SPEND.serialize()
+        out_group_ids = {x['entry']['actual_group_identifier'] for x in matched_events_group if (
+            x['entry']['event_type'] == serialized_type and
+            x['entry']['event_subtype'] == serialized_subtype
+        )}
+        return sorted(matched_events_group, key=lambda x: 0 if x['entry']['actual_group_identifier'] in out_group_ids else 1)  # noqa: E501
+    except KeyError as e:  # Shouldn't happen in theory but handle it just in case
+        log.error(f'Failed to sort matched events group due to missing key {e!s}')
+        return matched_events_group
 
 
 class HistoryService:
@@ -160,26 +184,33 @@ class HistoryService:
         }
         return {'result': result, 'message': '', 'status_code': HTTPStatus.OK}
 
-    def export_processed_history_csv(self, directory_path: Path) -> dict[str, Any]:
-        success, msg = self.rotkehlchen.accountant.export(directory_path)
-        if success is False:
-            return {'result': None, 'message': msg, 'status_code': HTTPStatus.CONFLICT}
+    def export_pnl_report_csv(
+            self,
+            report_id: int,
+            directory_path: Path | None,
+    ) -> dict[str, Any]:
+        export_result, message = export_pnl_report_csv_from_db(
+            database=self.rotkehlchen.data.db,
+            premium=self.rotkehlchen.premium,
+            report_id=report_id,
+            directory_path=directory_path,
+        )
+        return {
+            'result': export_result,
+            'message': message,
+            'status_code': HTTPStatus.CONFLICT if export_result is None else HTTPStatus.OK,
+        }
 
-        return {'result': True, 'message': '', 'status_code': HTTPStatus.OK}
+    def download_pnl_report_csv(self, report_id: int) -> dict[str, Any] | Response:
+        response = self.export_pnl_report_csv(report_id=report_id, directory_path=None)
+        if response.get('status_code') != HTTPStatus.OK:
+            return response
 
-    def download_processed_history_csv(self) -> dict[str, Any] | Response:
-        success, zipfile = self.rotkehlchen.accountant.export(directory_path=None)
-        if success is False:
-            return {
-                'result': None,
-                'message': 'Could not create a zip archive',
-                'status_code': HTTPStatus.CONFLICT,
-            }
-
+        file_path = response['result']['file_path']
         try:
-            register_post_download_cleanup(Path(zipfile))
+            register_post_download_cleanup(Path(file_path))
             return send_file(
-                path_or_file=zipfile,
+                path_or_file=file_path,
                 mimetype='application/zip',
                 as_attachment=True,
                 download_name='report.zip',
@@ -311,16 +342,6 @@ class HistoryService:
         )
 
         with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
-            events_result_info = dbevents.get_history_events_and_limit_info(
-                cursor=cursor,
-                filter_query=filter_query,
-                entries_limit=entries_limit,
-                aggregate_by_group_ids=aggregate_by_group_ids,
-                match_exact_events=True,
-            )
-            events_result = events_result_info.events
-            entries_found = events_result_info.entries_found
-            entries_with_limit = events_result_info.entries_with_limit
             entries_total = self.rotkehlchen.data.db.get_entries_count(
                 cursor=cursor,
                 entries_table='history_events',
@@ -332,14 +353,14 @@ class HistoryService:
             )
             hidden_event_ids = dbevents.get_hidden_event_ids(cursor)
             ignored_ids = self.rotkehlchen.data.db.get_ignored_action_ids(cursor=cursor)
-            processed_events_result, joined_group_ids, entries_found, entries_with_limit, entries_total, ignored_group_identifiers = dbevents.process_matched_asset_movements(  # noqa: E501
+            _, processed_events_result, joined_group_ids, entries_found, entries_with_limit, entries_total, ignored_group_identifiers = self._query_history_events_with_matched_processing(  # noqa: E501
                 cursor=cursor,
+                dbevents=dbevents,
+                filter_query=filter_query,
+                entries_limit=entries_limit,
                 aggregate_by_group_ids=aggregate_by_group_ids,
-                events_result=events_result,
-                entries_found=entries_found,
-                entries_with_limit=entries_with_limit,
+                match_exact_events=True,
                 entries_total=entries_total,
-                ignored_group_identifiers=set(events_result_info.ignored_group_identifiers),
             )
             group_has_ignored_assets = {
                 joined_group_ids.get(group_identifier, group_identifier)
@@ -436,16 +457,18 @@ class HistoryService:
             limit_type=UserLimitType.HISTORY_EVENTS,
         )
         with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
-            events_result = dbevents.get_history_events_and_limit_info(
+            processed_events_result: list[HistoryBaseEntry]
+            history_query_result = self._query_history_events_with_matched_processing(
                 cursor=cursor,
+                dbevents=dbevents,
                 filter_query=filter_query,
-                match_exact_events=match_exact_events,
                 entries_limit=entries_limit,
                 aggregate_by_group_ids=False,
+                match_exact_events=match_exact_events,
+                entries_total=0,
             )
-            history_events: list[HistoryBaseEntry] = events_result.events  # type: ignore[assignment]
-
-        if len(history_events) == 0:
+            processed_events_result = history_query_result[1]  # type: ignore[assignment]
+        if len(processed_events_result) == 0:
             return {
                 'result': None,
                 'message': 'No history processed in order to perform an export',
@@ -459,7 +482,7 @@ class HistoryService:
         serialized_history_events = []
         headers: dict[str, None] = {}
         query_data, unique_data = [], set()
-        for event in history_events:
+        for event in processed_events_result:
             if (entry := (event.asset, currency, ts_ms_to_sec(event.timestamp))) not in unique_data:  # noqa: E501
                 unique_data.add(entry)
                 query_data.append(entry)
@@ -483,7 +506,7 @@ class HistoryService:
         ).items():
             cached_db_prices[asset].update(timestamped_prices)
 
-        for event in history_events:
+        for event in processed_events_result:
             serialized_event = event.serialize_for_csv(
                 fiat_value=event.amount * cached_db_prices[event.asset][ts_ms_to_sec(event.timestamp)],  # noqa: E501
                 settings=settings,
@@ -627,6 +650,58 @@ class HistoryService:
         return {'result': result, 'message': message, 'status_code': HTTPStatus.OK}
 
     @staticmethod
+    def _query_history_events_with_matched_processing(
+            cursor: DBCursor,
+            dbevents: DBHistoryEvents,
+            filter_query: HistoryBaseEntryFilterQuery,
+            entries_limit: int | None,
+            aggregate_by_group_ids: bool,
+            match_exact_events: bool,
+            entries_total: int,
+    ) -> tuple[
+        HistoryEventsWithCountResult,
+        list[tuple[int, HistoryBaseEntry]] | list[HistoryBaseEntry],
+        dict[str, str],
+        int,
+        int,
+        int,
+        set[str],
+    ]:
+        """Fetch events and apply matched-asset-movement post-processing."""
+        events_result_info = dbevents.get_history_events_and_limit_info(
+            cursor=cursor,
+            filter_query=filter_query,
+            entries_limit=entries_limit,
+            aggregate_by_group_ids=aggregate_by_group_ids,
+            match_exact_events=match_exact_events,
+        )
+        (
+            processed_events_result,
+            joined_group_ids,
+            entries_found,
+            entries_with_limit,
+            entries_total,
+            ignored_group_identifiers,
+        ) = dbevents.process_matched_asset_movements(
+            cursor=cursor,
+            aggregate_by_group_ids=aggregate_by_group_ids,
+            events_result=events_result_info.events,
+            entries_found=events_result_info.entries_found,
+            entries_with_limit=events_result_info.entries_with_limit,
+            entries_total=entries_total,
+            ignored_group_identifiers=set(events_result_info.ignored_group_identifiers),
+        )
+        return (
+            events_result_info,
+            processed_events_result,
+            joined_group_ids,
+            entries_found,
+            entries_with_limit,
+            entries_total,
+            ignored_group_identifiers,
+        )
+
+    @staticmethod
     def _serialize_and_group_history_events(
             events: list[HistoryBaseEntry],
             aggregate_by_group_ids: bool,
@@ -640,8 +715,9 @@ class HistoryService:
     ) -> list[dict[str, Any] | list[dict[str, Any]]]:
         """Serialize and group history events for the api.
         Groups onchain swaps, multi trades, and matched asset movement events into sub-lists.
-        Uses the order defined in EVENT_GROUPING_ORDER as well as some custom logic for matched
-        asset movements to decide which events belong in which group.
+        For swaps, since the events will be sequential, grouping simply uses the order defined in
+        EVENT_GROUPING_ORDER. But for asset movement groups, there may be other events between
+        the movement and its matched event(s), so it can't simply rely on the order of the events.
 
         Args:
         - events: list of events to serialize and group
@@ -660,10 +736,10 @@ class HistoryService:
         Returns a list of serialized events with grouped events in sub-lists.
         """
         entries: list[dict[str, Any] | list[dict[str, Any]]] = []
-        current_group: list[dict[str, Any]] = []
-        current_asset_movement_group_id: str | None = None
+        current_sequential_group: list[dict[str, Any]] = []
+        current_matched_group: list[dict[str, Any]] = []
+        current_matched_group_id = None
         last_subtype_index: int | None = None
-        already_grouped_event_count = 0
         for event, event_accounting_rule_status, grouped_events_num in zip(
             events,
             event_accounting_rule_statuses,
@@ -693,32 +769,34 @@ class HistoryService:
 
             if (
                 replacement_group_id is not None and
-                event.group_identifier != current_asset_movement_group_id and
-                ((  # this is the matched event
-                    event.extra_data is not None and
-                    (current_asset_movement_group_id := event.extra_data.get('matched_asset_movement', {}).get('group_identifier')) is not None  # noqa: E501
-                ) or (  # or the matched event was an asset movement and this is its fee event
-                    event.entry_type == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT and
-                    event.event_subtype == HistoryEventSubType.FEE
-                ))
-            ):  # This event is part of the matched event for an asset movement.
-                if len(current_group) != already_grouped_event_count:
+                ((  # this is a matched event
+                     event.extra_data is not None and
+                     event.extra_data.get('matched_asset_movement') is not None
+                ) or
+                     event.entry_type == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT or
+                     event.event_type == HistoryEventType.EXCHANGE_ADJUSTMENT
+                )
+            ):  # This event is part of a matched asset movement group.
+                if len(current_sequential_group) > 0:  # First flush the current sequential group if present  # noqa: E501
+                    entries.append(current_sequential_group)
+                    current_sequential_group, last_subtype_index = [], None
+
+                if (
+                    current_matched_group_id is not None and
+                    current_matched_group_id != replacement_group_id
+                ):
                     # This is the beginning of an asset movement group coming immediately after
                     # another asset movement group. Add the current group to entries and reset
                     # to begin a new group.
-                    entries.append(current_group)
-                    current_group, already_grouped_event_count, last_subtype_index = [], 0, None
+                    entries.append(_sort_matched_group(current_matched_group))
+                    current_matched_group = []
 
-                # Append to current_group and increment already_grouped_event_count so the logic
-                # below using the EVENT_GROUPING_ORDER works correctly for the asset movement.
-                current_group.append(serialized)
-                already_grouped_event_count += 1
+                # Append to current_matched_group and set the current_matched_group_id
+                current_matched_group.append(serialized)
+                current_matched_group_id = replacement_group_id
             elif (event.entry_type in (
                 HistoryBaseEntryType.EVM_SWAP_EVENT,
                 HistoryBaseEntryType.SOLANA_SWAP_EVENT,
-            ) or (
-                event.group_identifier == current_asset_movement_group_id and
-                event.entry_type == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT
             )):
                 if (event_subtype_index := EVENT_GROUPING_ORDER[event.event_type].get(event.event_subtype)) is None:  # noqa: E501
                     log.error(
@@ -728,26 +806,140 @@ class HistoryService:
                     event_subtype_index = 0
 
                 if (
-                    len(current_group) == already_grouped_event_count or
+                    len(current_sequential_group) == 0 or
                     (last_subtype_index is not None and event_subtype_index >= last_subtype_index)
                 ):
-                    current_group.append(serialized)
+                    current_sequential_group.append(serialized)
                 else:  # Start a new group because the order is broken
-                    if len(current_group) > 0:
-                        entries.append(current_group)
-                    current_group = [serialized]
-                    already_grouped_event_count = 0
-                    current_asset_movement_group_id = None
+                    if len(current_sequential_group) > 0:
+                        entries.append(current_sequential_group)
+                    current_sequential_group = [serialized]
 
                 last_subtype_index = event_subtype_index
             else:  # Non-groupable event
-                if len(current_group) > 0:
-                    entries.append(current_group)
-                    current_group, already_grouped_event_count = [], 0
-                    last_subtype_index = current_asset_movement_group_id = None
+                if len(current_sequential_group) > 0:
+                    entries.append(current_sequential_group)
+                    current_sequential_group, last_subtype_index = [], None
+                if len(current_matched_group) > 0 and replacement_group_id is None:
+                    entries.append(_sort_matched_group(current_matched_group))
+                    current_matched_group, current_matched_group_id = [], None
                 entries.append(serialized)
 
-        if len(current_group) > 0:  # Append any remaining group
-            entries.append(current_group)
+        # Append any remaining groups
+        if len(current_sequential_group) > 0:
+            entries.append(current_sequential_group)
+        if len(current_matched_group) > 0:
+            entries.append(_sort_matched_group(current_matched_group))
 
         return entries
+
+    def refetch_staking_events(
+            self,
+            entry_type: Literal[HistoryBaseEntryType.ETH_BLOCK_EVENT, HistoryBaseEntryType.ETH_WITHDRAWAL_EVENT],  # noqa: E501
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+            validator_indices: list[int],
+            addresses: list[ChecksumEvmAddress],
+    ) -> dict[str, Any]:
+        """Refetch ETH staking events by re-querying external data sources.
+        Duplicates are handled by INSERT OR IGNORE.
+
+        For block production events, re-queries beaconcha.in (no time range filtering,
+        so all blocks for the validators are fetched). For withdrawal events, re-queries
+        etherscan within the specified time range.
+
+        validator_indices, addresses, and entry_type are pre-resolved by the schema.
+        Returns the total number of newly added events along with per-validator
+        and per-address breakdowns.
+        """
+        if (eth2 := self.rotkehlchen.chains_aggregator.get_module('eth2')) is None:
+            return {
+                'result': None,
+                'message': 'eth2 module is not active',
+                'status_code': HTTPStatus.CONFLICT,
+            }
+
+        db = self.rotkehlchen.data.db
+        serialized_entry_type = entry_type.serialize_for_db()
+        chunks = get_query_chunks(validator_indices)
+
+        def _count_staking_events() -> tuple[int, dict[int, int], dict[str, int]]:
+            total = 0
+            per_validator: dict[int, int] = defaultdict(int)
+            per_address: dict[str, int] = defaultdict(int)
+            with db.conn.read_ctx() as cursor:
+                for chunk, placeholders in chunks:
+                    for validator_index, location_label, count in cursor.execute(
+                        'SELECT S.validator_index, H.location_label, COUNT(*) '
+                        'FROM history_events H '
+                        'JOIN eth_staking_events_info S ON H.identifier = S.identifier '
+                        f'WHERE H.entry_type = ? AND S.validator_index IN ({placeholders}) '
+                        'GROUP BY S.validator_index, H.location_label',
+                        (serialized_entry_type, *chunk),
+                    ):
+                        total += count
+                        per_validator[validator_index] += count
+                        if location_label is not None:
+                            per_address[location_label] += count
+            return total, dict(per_validator), dict(per_address)
+
+        try:
+            before_total, before_validators, before_addresses = _count_staking_events()
+            if entry_type == HistoryBaseEntryType.ETH_BLOCK_EVENT:
+                log.debug(f'Refetching block production events for validator indices {validator_indices}')  # noqa: E501
+                eth2.beacon_inquirer.beaconchain.get_and_store_produced_blocks(
+                    indices=validator_indices,
+                    update_cache=False,
+                )
+                eth2.combine_block_with_tx_events()
+            else:
+                self._refetch_withdrawal_events(
+                    eth2=eth2,
+                    addresses=addresses,
+                    from_timestamp=from_timestamp,
+                    to_timestamp=to_timestamp,
+                )
+
+            after_total, after_validators, after_addresses = _count_staking_events()
+        except RemoteError as e:
+            return {
+                'result': None,
+                'message': str(e),
+                'status_code': HTTPStatus.BAD_GATEWAY,
+            }
+
+        new_validators = Counter(after_validators)
+        new_validators.subtract(before_validators)
+        new_addresses = Counter(after_addresses)
+        new_addresses.subtract(before_addresses)
+
+        return {'result': {
+            'total': after_total - before_total,
+            'per_validator': dict(+new_validators),
+            'per_address': dict(+new_addresses),
+        }, 'message': ''}
+
+    @staticmethod
+    def _refetch_withdrawal_events(
+            eth2: Eth2,
+            addresses: list[ChecksumEvmAddress],
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+    ) -> None:
+        """Re-query etherscan for withdrawal events in the specified time range without
+        modifying the existing query cache. Duplicates are handled by INSERT OR IGNORE.
+        """
+        if len(addresses) == 0:
+            return
+
+        log.debug(
+            f'Refetching withdrawal events for addresses {addresses} '
+            f'from {from_timestamp} to {to_timestamp}',
+        )
+        period = eth2.ethereum.maybe_timestamp_to_block_range(
+            TimestampOrBlockRange('timestamps', from_timestamp, to_timestamp),
+        )
+        for address in addresses:
+            eth2._fetch_withdrawals_from_external_sources(address, period)
+
+        eth2.detect_exited_validators()

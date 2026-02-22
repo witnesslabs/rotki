@@ -346,6 +346,9 @@
       "error": {
         "description": "查询{blockchain}账户失败：{message}",
         "title": "账户查询"
+      },
+      "task": {
+        "title": "正在查询{blockchain}账户"
       }
     },
     "history": {
@@ -1484,7 +1487,6 @@
     "title": "管理数据"
   },
   "data_table": {
-    "items_no": "项目 #",
     "no_data": "无数据",
     "rows_per_page": "每页行数"
   },
@@ -2943,25 +2945,25 @@
     "progress": "{progress} %"
   },
   "purge_selector": {
+    "centralized_exchange": "中心化交易所",
     "centralized_exchange_to_clear": {
       "hint": "清空该字段以删除所有中心化交易所的数据",
       "label": "集中交易所清零"
     },
-    "centralized_exchanges": "中心化交易所",
     "chain_to_clear": {
       "hint": "清空该字段以删除所有链的交易数据",
       "label": "链要清除"
     },
+    "decentralized_exchange": "去中心化交易所",
     "decentralized_exchange_to_clear": {
       "hint": "清空此字段以删除所有去中心化交易所的数据",
       "label": "去中心化交易所去清算"
     },
-    "decentralized_exchanges": "去中心化交易所",
+    "defi_module": "DeFi 模块",
     "defi_module_to_clear": {
       "hint": "清空此字段以删除所有 defi 模块的数据",
       "label": "待清除的 DeFi 模块"
     },
-    "defi_modules": "DeFi 模块",
     "label": "选择数据源",
     "transactions": "交易"
   },
@@ -3278,8 +3280,6 @@
       "headers": {
         "event_identifier": "事件组 ID"
       },
-      "loading": "正在加载事件...",
-      "no_data": "事件被隐藏是因为它们包含被忽略的资产",
       "skipped": {
         "csv_export_error": "导出为CSV时出错",
         "download_failed": "无法下载CSV",
@@ -3299,10 +3299,6 @@
             "title": "已处理的被跳过事件"
           }
         }
-      },
-      "view": {
-        "hide": "隐藏事件",
-        "show": "显示事件 ({length})"
       }
     },
     "filter": {

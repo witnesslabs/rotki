@@ -1,6 +1,6 @@
 import type { ComputedRef, Ref } from 'vue';
 import type { ActionStatus } from '@/types/action';
-import type { HistoryEventCollectionRow } from '@/types/history/events/schemas';
+import type { HistoryEventCollectionRow, HistoryEventEntry } from '@/types/history/events/schemas';
 import type { TaskMeta } from '@/types/task';
 import { useHistoryEventsApi } from '@/composables/api/history/events';
 import { useAssetMovementMatchingApi } from '@/composables/api/history/events/asset-movement-matching';
@@ -22,6 +22,12 @@ export interface UnmatchedAssetMovement extends RawUnmatchedAssetMovement {
   isFiat: boolean;
 }
 
+export interface PotentialMatchRow {
+  identifier: number;
+  entry: HistoryEventEntry;
+  isCloseMatch: boolean;
+}
+
 interface UseUnmatchedAssetMovementsReturn {
   unmatchedMovements: ComputedRef<UnmatchedAssetMovement[]>;
   ignoredMovements: ComputedRef<UnmatchedAssetMovement[]>;
@@ -31,7 +37,7 @@ interface UseUnmatchedAssetMovementsReturn {
   ignoredLoading: Ref<boolean>;
   autoMatchLoading: ComputedRef<boolean>;
   fetchUnmatchedAssetMovements: (onlyIgnored?: boolean) => Promise<void>;
-  matchAssetMovement: (assetMovementId: number, matchedEventId: number) => Promise<ActionStatus>;
+  matchAssetMovement: (assetMovementId: number, matchedEventIds: number[]) => Promise<ActionStatus>;
   refreshUnmatchedAssetMovements: (skipIgnored?: boolean) => Promise<void>;
   triggerAssetMovementAutoMatching: () => Promise<void>;
 }
@@ -132,10 +138,10 @@ export const useUnmatchedAssetMovements = createSharedComposable((): UseUnmatche
 
   const matchAssetMovement = async (
     assetMovementId: number,
-    matchedEventId: number,
+    matchedEventIds: number[],
   ): Promise<ActionStatus> => {
     try {
-      const success = await matchAssetMovementsApi(assetMovementId, matchedEventId);
+      const success = await matchAssetMovementsApi(assetMovementId, matchedEventIds);
 
       if (success) {
         setMessage({
@@ -166,7 +172,11 @@ export const useUnmatchedAssetMovements = createSharedComposable((): UseUnmatche
   };
 
   const triggerAssetMovementAutoMatching = async (): Promise<void> => {
+    if (get(isTaskRunning))
+      return;
+
     set(triggerAutoMatchLoading, true);
+
     try {
       const { taskId } = await triggerAssetMovementMatching();
 
@@ -179,6 +189,7 @@ export const useUnmatchedAssetMovements = createSharedComposable((): UseUnmatche
       );
 
       await refreshUnmatchedAssetMovements(true);
+      signalEventsModified();
     }
     catch (error: any) {
       logger.error('Failed to trigger auto match:', error);

@@ -2,6 +2,23 @@
 Changelog
 =========
 
+* :feature:`10868` Farcaster Pro Purchases will now be properly understood by rotki.
+* :feature:`11702` Zerox Base Swaps through the latest settler  will now be properly decoded.
+
+* :release:`1.42.0 <2025-02-20>`
+* :feature:`-` Octant v2 migration is now supported and GLM locked in v2 detected.
+* :feature:`-` Monerium transactions on Base will now be decoded properly.
+* :feature:`10873` Users can now track Lido CSM node-operator bond balances by linking the accounting contract to their addresses.
+* :bug:`-` Clicking on non-snapshot data points in the net worth graph will no longer open the snapshot export dialog.
+* :bug:`-` 1inch v5 swaps routed through wombat router will now be decoded properly
+* :feature:`11583` Users can now re-pull missing ETH staking withdrawal events for specific validators or addresses within a chosen time range.
+* :feature:`11582` Users can now re-pull missing ETH staking block production events for specific validators or addresses within a chosen time range.
+* :bug:`-` The Kraken staking page will no longer get stuck on the loading screen when the backend is unresponsive.
+* :feature:`-` Users can now export CSV reports for any PnL report, including the old ones.
+* :bug:`11551` Unrelated ENS events should no longer appear in your events if bundled in a transaction affecting you.
+* :bug:`-` More Gearbox reward claims will now be automatically decoded in the history view.
+* :bug:`11483` Coinbase swaps where the spend/receive asset and amount are identical will no longer be shown.
+* :bug:`-` Additional base 0x swaps will now be automatically decoded in the history view.
 * :bug:`11440` Users will no longer get stuck after pressing the submit button when creating history events.
 * :feature:`11334` Users can now detect and fix duplicate events that occur when customized events are re-pulled from the blockchain.
 * :feature:`11385` When authenticating for monerium on linux AppImage the cookie will no longer be shared between different accounts.
@@ -16,7 +33,6 @@ Changelog
 * :bug:`11245` Users will now be able to select February in the date picker when the current date's day is greater than 28.
 * :bug:`-` Tags will no longer be duplicated in the assets view for EVM accounts.
 * :feature:`-` rotki is now available in Russian.
-* :feature:`11253` Premium users can now view their historical asset balances at any point in time, calculated from their transaction history.
 * :feature:`-` Users can now add smart contract addresses to all EVM chains at once. Contracts are automatically detected and tagged with a reserved "Contract" system tag. If users previously had a custom "Contract" tag, it will be updated to "Contract (Custom)".
 * :feature:`1606` Users can now query their Kraken Futures balances by providing Futures API keys in the exchange settings.
 * :feature:`11225` Transactions you send to your own address are now shown as neutral self-transactions.
@@ -103,7 +119,6 @@ Changelog
 * :bug:`11005` Fix an issue where adding a new manual balance with a custom asset/price unnecessarily fetches prices for all assets.
 * :bug:`10997` Binance CSV import will now properly handle trades with different counts of spend versus buy entries.
 * :feature:`9230` rotki will now provide quick options for the date time picker.
-* :feature:`10873` Users can now track Lido CSM node-operator bond balances by linking the accounting contract to their addresses.
 * :bug:`10979` Binance CSV import will now properly handle multiple trades with identical amounts at the same timestamp.
 * :bug:`10984` Fix Binance CSV import crash when multiple trades with different pairs occur at the same time.
 * :bug:`10960` rotki will now support swaps with fees in multiple different assets.

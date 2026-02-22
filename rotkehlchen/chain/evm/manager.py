@@ -64,16 +64,6 @@ class EvmManager(
         self.accounting_aggregator = accounting_aggregator
         self.active_management = ActiveManager(node_inquirer=node_inquirer)
 
-    def get_historical_balance(
-            self,
-            address: ChecksumEvmAddress,
-            block_number: int,
-    ) -> FVal | None:
-        """Attempts to get a historical eth balance from the local own node only.
-        If there is no node or the node can't query historical balance (not archive) then
-        returns None"""
-        return self.node_inquirer.get_historical_native_balance(address, block_number)
-
     def query_balances(
             self,
             addresses: Sequence[ChecksumEvmAddress],
@@ -99,7 +89,7 @@ class EvmManager(
         """Queries and saves the transactions for the given addresses in the specified time range.
         May raise:
         - RemoteError if there is a problem with an external query.
-        - pysqlcipher3.dbapi2.OperationalError if the SQL query fails due to
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to
         invalid filtering arguments.
         """
         self.transactions.query_chain(

@@ -85,6 +85,17 @@ ECDSA_PRIVATE_KEY_RE: re.Pattern = re.compile(
 )
 
 
+def _is_same_asset_amount_trade(spend: AssetAmount, receive: AssetAmount) -> bool:
+    """There are some cases where coinbase reports trades from/to the same asset.
+    This has been noticed especially in connection with EURc->EUR and USDC->USD swaps
+    where there would be an extra useless EUR->EUR or USD->USD swap.
+
+    Returns True if the amounts and assets are the same on the spend and receive, otherwise
+    returns False.
+    """
+    return spend == receive
+
+
 class CoinbaseKeyType(Enum):
     """Coinbase API key types with their corresponding authentication algorithms"""
     ECDSA = 'ES256'
@@ -700,11 +711,17 @@ class Coinbase(ExchangeInterface):
                     amount=abs(deserialize_fval(fee_data['amount'])),
                 )
 
+        if _is_same_asset_amount_trade(
+            spend=(spend := AssetAmount(asset=tx_asset, amount=tx_amount)),
+            receive=(receive := AssetAmount(asset=native_asset, amount=native_amount)),
+        ):
+            return []
+
         return create_swap_events(
             timestamp=ts_sec_to_ms(timestamp),
             location=self.location,
-            spend=AssetAmount(asset=tx_asset, amount=tx_amount),
-            receive=AssetAmount(asset=native_asset, amount=native_amount),
+            spend=spend,
+            receive=receive,
             fee=fee,
             location_label=self.name,
             group_identifier=create_group_identifier_from_unique_id(
@@ -791,11 +808,17 @@ class Coinbase(ExchangeInterface):
             if event['type'] == 'buy' else  # Either buy or sell in _process_normal_trade
             (tx_asset, tx_amount, native_asset, native_amount)
         )
+        if _is_same_asset_amount_trade(
+            spend=(spend := AssetAmount(asset=spend_asset, amount=spend_amount)),
+            receive=(receive := AssetAmount(asset=receive_asset, amount=receive_amount)),
+        ):
+            return []
+
         return create_swap_events(
             timestamp=ts_sec_to_ms(timestamp),
             location=self.location,
-            spend=AssetAmount(asset=spend_asset, amount=spend_amount),
-            receive=AssetAmount(asset=receive_asset, amount=receive_amount),
+            spend=spend,
+            receive=receive,
             fee=AssetAmount(
                 amount=abs(deserialize_fval_or_zero(event['fee']['amount'])),
                 asset=asset_from_coinbase(event['fee']['currency'], time=timestamp),
@@ -857,6 +880,9 @@ class Coinbase(ExchangeInterface):
             amount=abs(amount),
             rate=rate,
         )
+        if _is_same_asset_amount_trade(spend=spend, receive=receive):
+            return []
+
         return create_swap_events(
             timestamp=ts_sec_to_ms(timestamp),
             location=self.location,
@@ -897,21 +923,26 @@ class Coinbase(ExchangeInterface):
             transaction_id, transaction_hash = raw_data.get('id'), None
             notes, fee = None, None
             tx_type = raw_data['type']  # not sure if fiat
-            event_type: Literal[HistoryEventType.DEPOSIT, HistoryEventType.WITHDRAWAL]
             amount_data = raw_data['amount']
             # 'pro_deposit' is treated as withdrawal since it debits funds from Coinbase
             # See: https://docs.cdp.coinbase.com/coinbase-app/docs/api-transactions#parameters
             if tx_type == 'fiat_withdrawal':
-                event_type = HistoryEventType.WITHDRAWAL
+                event_subtype: Literal[
+                    HistoryEventSubType.RECEIVE,
+                    HistoryEventSubType.SPEND,
+                ] = HistoryEventSubType.SPEND
             elif tx_type == 'pro_deposit':
                 notes = 'Transfer funds to CoinbasePro'
-                event_type = HistoryEventType.WITHDRAWAL
+                event_subtype = HistoryEventSubType.SPEND
             elif tx_type in ('send', 'tx'):
-                event_type = HistoryEventType.WITHDRAWAL if amount_data['amount'].startswith('-') else HistoryEventType.DEPOSIT  # noqa: E501
+                if amount_data['amount'].startswith('-'):
+                    event_subtype = HistoryEventSubType.SPEND
+                else:
+                    event_subtype = HistoryEventSubType.RECEIVE
             elif tx_type == 'fiat_deposit':
-                event_type = HistoryEventType.DEPOSIT
+                event_subtype = HistoryEventSubType.RECEIVE
             elif tx_type == 'pro_withdrawal':
-                event_type = HistoryEventType.DEPOSIT
+                event_subtype = HistoryEventSubType.RECEIVE
                 notes = 'Transfer funds from CoinbasePro'
             else:
                 log.error(
@@ -954,7 +985,7 @@ class Coinbase(ExchangeInterface):
                 return None  # Can ignore. https://github.com/rotki/rotki/issues/3901
 
             if 'from' in raw_data:
-                event_type = HistoryEventType.DEPOSIT
+                event_subtype = HistoryEventSubType.RECEIVE
 
         except UnknownAsset as e:
             self.send_unknown_asset_message(
@@ -982,7 +1013,7 @@ class Coinbase(ExchangeInterface):
             return create_asset_movement_with_fee(
                 location=self.location,
                 location_label=self.name,
-                event_type=event_type,
+                event_subtype=event_subtype,
                 timestamp=ts_sec_to_ms(timestamp),
                 asset=asset,
                 amount=amount,

@@ -3,21 +3,10 @@ import { bigNumberify } from '@rotki/common';
 import { createCustomPinia } from '@test/utils/create-pinia';
 import { updateGeneralSettings } from '@test/utils/general-settings';
 import { mount, type VueWrapper } from '@vue/test-utils';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import ValueDisplay from '@/modules/amount-display/components/ValueDisplay.vue';
 import { useFrontendSettingsStore } from '@/store/settings/frontend';
 import { useCurrencies } from '@/types/currencies';
-
-vi.mock('vue-router', () => ({
-  useRoute: vi.fn(),
-  useRouter: vi.fn().mockReturnValue({
-    push: vi.fn(),
-  }),
-  createRouter: vi.fn().mockImplementation(() => ({
-    beforeEach: vi.fn(),
-  })),
-  createWebHashHistory: vi.fn(),
-}));
 
 describe('modules/amount-display/components/ValueDisplay', () => {
   let wrapper: VueWrapper<InstanceType<typeof ValueDisplay>>;
@@ -106,6 +95,17 @@ describe('modules/amount-display/components/ValueDisplay', () => {
         props: { value: bigNumberify(1.5) },
       });
       expect(wrapper.find('[data-cy="display-amount"]').text()).not.toBe('1.50');
+    });
+
+    it('should not scramble the value when noScramble is true', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          noScramble: true,
+          value: bigNumberify(1.5),
+        },
+      });
+      expect(wrapper.find('[data-cy="display-amount"]').text()).toBe('1.50');
     });
   });
 

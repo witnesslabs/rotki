@@ -15,8 +15,8 @@ import gevent
 from flask import Response, make_response, send_file
 from gevent.event import Event
 from gevent.lock import Semaphore
-from pysqlcipher3 import dbapi2 as sqlcipher
 from solders.solders import Signature
+from sqlcipher3 import dbapi2 as sqlcipher
 from web3.exceptions import BadFunctionCallOutput
 from werkzeug.datastructures import FileStorage
 
@@ -73,11 +73,14 @@ from rotkehlchen.constants.misc import (
     HTTP_STATUS_INTERNAL_DB_ERROR,
 )
 from rotkehlchen.data_import.manager import DataImportSource
-from rotkehlchen.db.cache import ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE, DBCacheDynamic, DBCacheStatic
+from rotkehlchen.db.cache import IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX
 from rotkehlchen.db.calendar import CalendarEntry, CalendarFilterQuery, ReminderEntry
 from rotkehlchen.db.constants import (
+    HISTORY_MAPPING_KEY_STATE,
     LINKABLE_ACCOUNTING_PROPERTIES,
     LINKABLE_ACCOUNTING_SETTINGS_NAME,
+    HistoryEventLinkType,
+    HistoryMappingState,
 )
 from rotkehlchen.db.eth2 import DBEth2
 from rotkehlchen.db.filtering import (
@@ -122,6 +125,7 @@ from rotkehlchen.errors.misc import (
     SystemPermissionError,
 )
 from rotkehlchen.errors.price import NoPriceForGivenTimestamp
+from rotkehlchen.errors.serialization import DeserializationError
 from rotkehlchen.exchanges.constants import ALL_SUPPORTED_EXCHANGES, SUPPORTED_EXCHANGES
 from rotkehlchen.exchanges.utils import query_binance_exchange_pairs
 from rotkehlchen.externalapis.github import Github
@@ -152,12 +156,12 @@ from rotkehlchen.tasks.events import (
     ENTRY_TYPES_TO_EXCLUDE_FROM_MATCHING,
     find_asset_movement_matches,
     find_customized_event_duplicate_groups,
+    get_already_matched_event_ids,
     get_unmatched_asset_movements,
     process_asset_movements,
     should_exclude_possible_match,
     update_asset_movement_matched_event,
 )
-from rotkehlchen.tasks.historical_balances import process_historical_balances
 from rotkehlchen.types import (
     AVAILABLE_MODULES_MAP,
     CHAINS_WITH_TRANSACTION_DECODERS_TYPE,
@@ -200,7 +204,6 @@ from rotkehlchen.types import (
     SubstrateAddress,
     SupportedBlockchain,
     Timestamp,
-    TimestampMS,
     UserNote,
 )
 from rotkehlchen.utils.misc import ts_ms_to_sec, ts_now
@@ -1278,16 +1281,6 @@ class RestAPI:
         response_data = self.history_service.get_history_actionable_items()
         return make_response_from_dict(response_data)
 
-    def export_processed_history_csv(self, directory_path: Path) -> Response:
-        response_data = self.history_service.export_processed_history_csv(directory_path)
-        return make_response_from_dict(response_data)
-
-    def download_processed_history_csv(self) -> Response:
-        response = self.history_service.download_processed_history_csv()
-        if isinstance(response, Response):
-            return response
-        return make_response_from_dict(response)
-
     def get_history_status(self) -> Response:
         response_data = self.history_service.get_history_status()
         return make_response_from_dict(response_data)
@@ -1978,6 +1971,23 @@ class RestAPI:
     ) -> Response:
         DBHistoryEvents(self.rotkehlchen.data.db).reset_eth_staking_data(entry_type=entry_type)
         return api_response(OK_RESULT, status_code=HTTPStatus.OK)
+
+    @async_api_call()
+    def refetch_staking_events(
+            self,
+            entry_type: Literal[HistoryBaseEntryType.ETH_BLOCK_EVENT, HistoryBaseEntryType.ETH_WITHDRAWAL_EVENT],  # noqa: E501
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+            validator_indices: list[int],
+            addresses: list[ChecksumEvmAddress],
+    ) -> dict[str, Any]:
+        return self.history_service.refetch_staking_events(
+            entry_type=entry_type,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            validator_indices=validator_indices,
+            addresses=addresses,
+        )
 
     @overload
     def delete_blockchain_transaction_data(
@@ -2762,6 +2772,19 @@ class RestAPI:
 
         return api_response(_wrap_in_ok_result(details), status_code=HTTPStatus.OK)
 
+    def get_history_event_group_position(
+            self,
+            group_identifier: str,
+            filter_query: HistoryBaseEntryFilterQuery,
+    ) -> Response:
+        """Gets the 0-based group position of a history event group in the filtered sorted list."""
+        dbevents = DBHistoryEvents(self.rotkehlchen.data.db)
+        position = dbevents.get_history_event_group_position(
+            group_identifier=group_identifier,
+            filter_query=filter_query,
+        )
+        return api_response(_wrap_in_ok_result({'position': position if position is not None else -1}), status_code=HTTPStatus.OK)  # noqa: E501
+
     @async_api_call()
     def add_transaction_by_reference(
             self,
@@ -3084,6 +3107,47 @@ class RestAPI:
             to_timestamp: Timestamp,
     ) -> Response:
         assets: tuple[Asset, ...]
+        try:
+            if asset is not None:
+                assets = (asset,)
+            else:  # collection_id is present due to validation.
+                with GlobalDBHandler().conn.read_ctx() as cursor:
+                    cursor.execute(
+                        'SELECT asset FROM multiasset_mappings WHERE collection_id=?',
+                        (collection_id,),
+                    )
+                    assets = tuple(Asset(row[0]) for row in cursor)
+
+            balances, last_group_identifier = HistoricalBalancesManager(self.rotkehlchen.data.db).get_assets_amounts(  # noqa: E501
+                assets=assets,
+                from_ts=from_timestamp,
+                to_ts=to_timestamp,
+            )
+        except DeserializationError as e:
+            return api_response(wrap_in_fail_result(str(e)), status_code=HTTPStatus.INTERNAL_SERVER_ERROR)  # noqa: E501
+        except NotFoundError as e:
+            return api_response(wrap_in_fail_result(str(e)), status_code=HTTPStatus.NOT_FOUND)
+
+        result = {
+            'times': list(balances),
+            'values': [str(x) for x in balances.values()],
+        }
+        if last_group_identifier is not None:
+            result['last_group_identifier'] = last_group_identifier
+
+        return api_response(_wrap_in_ok_result(result=result))
+
+    def get_historical_asset_amounts_event_metrics(
+            self,
+            asset: Asset | None,
+            collection_id: int | None,
+            from_timestamp: Timestamp,
+            to_timestamp: Timestamp,
+    ) -> Response:
+        """Get historical asset amounts via the event metrics table.
+        TODO (balances): Replace get_historical_asset_amounts with this.
+        """
+        assets: tuple[Asset, ...]
         if asset is not None:
             assets = (asset,)
         else:  # collection_id is present due to validation.
@@ -3094,7 +3158,7 @@ class RestAPI:
                 )
                 assets = tuple(Asset(row[0]) for row in cursor)
 
-        processing_required, amounts = HistoricalBalancesManager(self.rotkehlchen.data.db).get_assets_amounts(  # noqa: E501
+        processing_required, amounts = HistoricalBalancesManager(self.rotkehlchen.data.db).get_assets_amounts_event_metrics(  # noqa: E501
             assets=assets,
             from_ts=from_timestamp,
             to_ts=to_timestamp,
@@ -3110,21 +3174,23 @@ class RestAPI:
     def trigger_task(self, task: TaskName) -> dict[str, Any]:
         """Trigger the specified async task."""
         if task == TaskName.HISTORICAL_BALANCE_PROCESSING:
-            with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
-                stale_from_ts = TimestampMS(int(value)) if (value := self.rotkehlchen.data.db.get_static_cache(  # noqa: E501
-                    cursor=cursor,
-                    name=DBCacheStatic.STALE_BALANCES_FROM_TS,
-                )) is not None else None
-
-            process_historical_balances(
-                database=self.rotkehlchen.data.db,
-                msg_aggregator=self.rotkehlchen.msg_aggregator,
-                from_ts=stale_from_ts,
-            )
+            return wrap_in_fail_result('Historical balance processing is temporarily disabled.')
         else:  # task == TaskName.ASSET_MOVEMENT_MATCHING
             process_asset_movements(database=self.rotkehlchen.data.db)
 
         return OK_RESULT
+
+    def set_scheduler_state(self, enabled: bool) -> Response:
+        """Enable or disable the periodic task scheduler.
+
+        This should be called by the frontend once initial data loading is complete
+        (transaction decoding, balances fetch, asset movement matching, historical
+        balance processing). This ensures background tasks that require exclusive
+        database write access (like backup sync) don't run during DB upgrades,
+        migrations, and asset updates.
+        """
+        self.rotkehlchen.task_manager.should_schedule = enabled  # type: ignore[union-attr]  # should exist here
+        return api_response(_wrap_in_ok_result(result={'enabled': enabled}))
 
     def get_historical_netvalue(
             self,
@@ -3181,12 +3247,14 @@ class RestAPI:
             balance = evm_manager.node_inquirer.get_historical_native_balance(
                 address=address,
                 block_number=block_number,
+                queried_timestamp=timestamp,
             )
         else:
             balance = evm_manager.node_inquirer.get_historical_token_balance(
                 token=asset.resolve_to_evm_token(),
                 address=address,
                 block_number=block_number,
+                queried_timestamp=timestamp,
             )
 
         if balance is None:
@@ -3478,49 +3546,70 @@ class RestAPI:
     def match_asset_movements(
             self,
             asset_movement_identifier: int,
-            matched_event_identifier: int | None,
+            matched_event_identifiers: list[int],
     ) -> Response:
-        """Match an exchange asset movement to an onchain event, or mark the movement as having
-        no match if the matched_event_identifier is None.
+        """Match an exchange asset movement to onchain event(s), or mark the movement as having
+        no match if no matched_event_identifiers are specified.
         """
-        if matched_event_identifier is None:
+        if len(matched_event_identifiers) == 0:
             # No matched event specified. Mark as having no match so this movement will be ignored.
             with self.rotkehlchen.data.db.conn.write_ctx() as write_cursor:
-                self.rotkehlchen.data.db.set_dynamic_cache(
-                    write_cursor=write_cursor,
-                    name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-                    identifier=asset_movement_identifier,
-                    value=ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE,
+                write_cursor.execute(
+                    'INSERT OR IGNORE INTO history_event_link_ignores(event_id, link_type) '
+                    'VALUES(?, ?)',
+                    (asset_movement_identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
                 )
             return api_response(OK_RESULT)
 
         events_db = DBHistoryEvents(database=self.rotkehlchen.data.db)
-        asset_movement = matched_event = None
+        asset_movement, matched_events, fee_event = None, [], None
         with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
             for event in events_db.get_history_events_internal(
                 cursor=cursor,
                 filter_query=HistoryEventFilterQuery.make(
-                    identifiers=[asset_movement_identifier, matched_event_identifier],
+                    identifiers=[asset_movement_identifier, *matched_event_identifiers],
                 ),
             ):
                 if event.identifier == asset_movement_identifier:
                     asset_movement = event
-                elif event.identifier == matched_event_identifier:
-                    matched_event = event
+                elif event.identifier in matched_event_identifiers:
+                    matched_events.append(event)
+
+            if (
+                asset_movement is not None and
+                len(matched_events) > 0 and
+                len(fee_events := events_db.get_history_events_internal(
+                    cursor=cursor,
+                    filter_query=HistoryEventFilterQuery.make(
+                        entry_types=IncludeExcludeFilterData(
+                            values=[HistoryBaseEntryType.ASSET_MOVEMENT_EVENT],
+                        ),
+                        group_identifiers=[asset_movement.group_identifier],
+                        event_subtypes=[HistoryEventSubType.FEE],
+                    ),
+                )) == 1
+            ):
+                fee_event = fee_events[0]  # Asset movements only support one fee
 
         if asset_movement is None or not isinstance(asset_movement, AssetMovement):
             error_msg = f'No asset movement event found in the DB for identifier {asset_movement_identifier}'  # noqa: E501
-        elif matched_event is None:
-            error_msg = f'No event found in the DB for identifier {matched_event_identifier}'
-        else:
-            success, error_msg = update_asset_movement_matched_event(
-                events_db=events_db,
-                asset_movement=asset_movement,
-                matched_event=matched_event,
-                is_deposit=asset_movement.event_type == HistoryEventType.DEPOSIT,
-            )
-            if success:
-                return api_response(OK_RESULT)
+        elif len(matched_events) != len(matched_event_identifiers):
+            error_msg = f'Some of the specified matched event identifiers {matched_event_identifiers} are missing from the DB.'  # noqa: E501
+        else:  # Successfully found events for the provided ids. Update the matched events.
+            # Don't allow adding any adjustment events when multi-matching since there are
+            # expected to be differences between the movement amount and each individual matched
+            # event's amount in that case.
+            allow_adding_adjustments = len(matched_events) == 1
+            for matched_event in matched_events:
+                update_asset_movement_matched_event(
+                    events_db=events_db,
+                    asset_movement=asset_movement,
+                    fee_event=fee_event,  # type: ignore[arg-type]  # Will be asset movement fee. Query is filtered by entry type above.
+                    matched_event=matched_event,
+                    is_deposit=asset_movement.event_subtype == HistoryEventSubType.RECEIVE,
+                    allow_adding_adjustments=allow_adding_adjustments,
+                )
+            return api_response(OK_RESULT)
 
         return api_response(wrap_in_fail_result(message=error_msg), HTTPStatus.BAD_REQUEST)
 
@@ -3532,14 +3621,12 @@ class RestAPI:
         if only_ignored:
             with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
                 movement_group_ids = [x[0] for x in cursor.execute(
-                    'SELECT DISTINCT group_identifier FROM history_events WHERE identifier IN ('
-                    'SELECT SUBSTR(name, ?) FROM key_value_cache WHERE name LIKE ? and value = ?) '
+                    'SELECT DISTINCT history_events.group_identifier FROM history_events '
+                    'JOIN history_event_link_ignores ON '
+                    'history_events.identifier=history_event_link_ignores.event_id '
+                    'WHERE history_event_link_ignores.link_type=? '
                     'ORDER BY timestamp, sequence_index',
-                    (
-                        len(DBCacheDynamic.MATCHED_ASSET_MOVEMENT.name) + 2,
-                        f'{DBCacheDynamic.MATCHED_ASSET_MOVEMENT.name.lower()}%',
-                        ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE,
-                    ),
+                    (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),),
                 )]
         else:
             asset_movements, _ = get_unmatched_asset_movements(database=self.rotkehlchen.data.db)
@@ -3547,6 +3634,17 @@ class RestAPI:
             movement_group_ids = list(dict.fromkeys(event.group_identifier for event in asset_movements))  # noqa: E501
 
         return api_response(_wrap_in_ok_result(result=movement_group_ids))
+
+    def _get_ignored_ced_group_ids(self) -> list[str]:
+        """Return group identifiers that have been marked as ignored false positives."""
+        with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
+            return [
+                row[0]
+                for row in cursor.execute(
+                    'SELECT value FROM key_value_cache WHERE name LIKE ?',
+                    (f'{IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX}%',),
+                )
+            ]
 
     @async_api_call()
     def get_customized_event_duplicates(self) -> dict[str, Any]:
@@ -3557,6 +3655,7 @@ class RestAPI:
         return _wrap_in_ok_result(result={
             'auto_fix_group_ids': auto_fix_group_ids,
             'manual_review_group_ids': manual_review_group_ids,
+            'ignored_group_ids': self._get_ignored_ced_group_ids(),
         })
 
     @async_api_call()
@@ -3595,43 +3694,117 @@ class RestAPI:
             'manual_review_group_ids': manual_review_group_ids,
         })
 
+    @async_api_call()
+    def ignore_customized_event_duplicates(
+            self,
+            group_identifiers: list[str],
+    ) -> dict[str, Any]:
+        """Mark the given group identifiers as ignored false positives."""
+        with self.rotkehlchen.data.db.conn.write_ctx() as write_cursor:
+            write_cursor.executemany(
+                'INSERT OR IGNORE INTO key_value_cache(name, value) VALUES(?, ?)',
+                [
+                    (f'{IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX}{gid}', gid)
+                    for gid in group_identifiers
+                ],
+            )
+        return _wrap_in_ok_result(result=self._get_ignored_ced_group_ids())
+
+    @async_api_call()
+    def unignore_customized_event_duplicates(
+            self,
+            group_identifiers: list[str],
+    ) -> dict[str, Any]:
+        """Remove the ignored false positive markers for the given group identifiers."""
+        with self.rotkehlchen.data.db.conn.write_ctx() as write_cursor:
+            placeholders = ','.join('?' for _ in group_identifiers)
+            write_cursor.execute(
+                f'DELETE FROM key_value_cache WHERE name IN ({placeholders})',
+                [
+                    f'{IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX}{gid}'
+                    for gid in group_identifiers
+                ],
+            )
+        return _wrap_in_ok_result(result=self._get_ignored_ced_group_ids())
+
     def unlink_matched_asset_movements(
             self,
-            asset_movement_identifier: int,
+            identifier: int,
     ) -> Response:
         """Unlink an asset movement from its matched event. Also attempts to remove an entry for
         the matched event's identifier since it could be two asset movements matched to each other
         in which case there is an entry for both.
 
-        Note that the matched event is not modified to revert the changes to its event type, notes,
-        counterparty, etc since this info is no longer available. While we could have this stored
-        in the extra data, the event may also have been edited by user since the matching, and we
-        would risk overwriting user changes. For onchain events at least, the user can manually
-        delete the event and redecode the tx to reset it if needed.
+        For matches created by this app, events are restored from backups saved prior to matching,
+        including event type/subtype, notes, and counterparty.
         """
         with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
-            matched_event_identifier = self.rotkehlchen.data.db.get_dynamic_cache(
-                cursor=cursor,
-                name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-                identifier=asset_movement_identifier,
-            )
+            linked_ids = defaultdict(list)
+            for movement_id, matched_id in cursor.execute(
+                'SELECT left_event_id, right_event_id FROM history_event_links '
+                'WHERE link_type=? AND (left_event_id=? OR right_event_id=?)',
+                (HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(), identifier, identifier),  # noqa: E501
+            ):
+                linked_ids[movement_id].append(matched_id)
 
-        if matched_event_identifier is None:
-            return api_response(wrap_in_fail_result(message=(
-                f'asset movement {asset_movement_identifier} is not matched with an event '
-                f'or marked as having no match'
-            )), HTTPStatus.BAD_REQUEST)
+        if len(linked_ids) == 0:
+            with self.rotkehlchen.data.db.conn.write_ctx() as write_cursor:
+                if write_cursor.execute(
+                    'DELETE FROM history_event_link_ignores WHERE event_id=? AND link_type=?',
+                    (identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),
+                ).rowcount == 0:
+                    return api_response(wrap_in_fail_result(message=(
+                        f'The specified identifier {identifier} does not correspond to either the '
+                        'asset movement or its match for any matched pairs in the DB.'
+                    )), HTTPStatus.BAD_REQUEST)
+
+                return api_response(OK_RESULT)
 
         with self.rotkehlchen.data.db.conn.write_ctx() as write_cursor:
-            for identifier in (
-                [asset_movement_identifier]
-                if matched_event_identifier == ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE else
-                [asset_movement_identifier, matched_event_identifier]
-            ):
-                self.rotkehlchen.data.db.delete_dynamic_cache(
+            for asset_movement_identifier, matched_event_identifiers in linked_ids.items():
+                write_cursor.execute(
+                    'DELETE FROM history_event_links WHERE left_event_id=? AND link_type=?',
+                    (asset_movement_identifier, HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()),  # noqa: E501
+                )
+                write_cursor.executemany(
+                    'DELETE FROM history_event_links WHERE left_event_id=? AND right_event_id=? '
+                    'AND link_type=?',
+                    [(
+                        matched_event_identifier,
+                        asset_movement_identifier,
+                        HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
+                    ) for matched_event_identifier in matched_event_identifiers],
+                )
+                # Remove any adjustment event that was added during matching
+                write_cursor.executemany(
+                    'DELETE FROM history_events WHERE type=? AND group_identifier IN '
+                    '(SELECT group_identifier FROM history_events WHERE identifier IN (?, ?))'
+                    'AND identifier IN (SELECT parent_identifier FROM history_events_mappings '
+                    'WHERE name=? AND value=?)',
+                    [(
+                        HistoryEventType.EXCHANGE_ADJUSTMENT.serialize(),
+                        asset_movement_identifier,
+                        matched_event_identifier,
+                        HISTORY_MAPPING_KEY_STATE,
+                        HistoryMappingState.MATCHED.serialize_for_db(),
+                    ) for matched_event_identifier in matched_event_identifiers],
+                )
+                # Restore events from the backup created before matching
+                DBHistoryEvents.maybe_restore_history_events_from_backup(
                     write_cursor=write_cursor,
-                    name=DBCacheDynamic.MATCHED_ASSET_MOVEMENT,
-                    identifier=str(identifier),
+                    identifiers=[*matched_event_identifiers, asset_movement_identifier],
+                )
+                # Remove the auto-matched event state
+                placeholders = ','.join(['?'] * (len(matched_event_identifiers) + 1))
+                write_cursor.execute(
+                    'DELETE FROM history_events_mappings '
+                    f'WHERE parent_identifier IN({placeholders}) AND name=? AND value=?',
+                    (
+                        *matched_event_identifiers,
+                        asset_movement_identifier,
+                        HISTORY_MAPPING_KEY_STATE,
+                        HistoryMappingState.MATCHED.serialize_for_db(),
+                    ),
                 )
 
         return api_response(OK_RESULT)
@@ -3672,15 +3845,17 @@ class RestAPI:
 
         with self.rotkehlchen.data.db.conn.read_ctx() as cursor:
             blockchain_accounts = self.rotkehlchen.data.db.get_blockchain_accounts(cursor=cursor)
+            already_matched_event_ids = get_already_matched_event_ids(cursor=cursor)
             close_match_identifiers = [x.identifier for x in find_asset_movement_matches(
                 events_db=events_db,
                 asset_movement=asset_movement,  # type: ignore  # filtered by entry_types
-                is_deposit=asset_movement.event_type == HistoryEventType.DEPOSIT,
+                is_deposit=asset_movement.event_subtype == HistoryEventSubType.RECEIVE,
                 fee_event=fee_event,  # type: ignore  # filtered by entry_types
                 match_window=time_range,
                 cursor=cursor,
                 assets_in_collection=assets_in_collection,
                 blockchain_accounts=blockchain_accounts,
+                already_matched_event_ids=already_matched_event_ids,
                 tolerance=tolerance,
             )]
 
@@ -3690,7 +3865,7 @@ class RestAPI:
                     order_by_rules=[(f'ABS(timestamp - {asset_movement.timestamp})', True)],
                     from_ts=Timestamp(asset_movement_timestamp - time_range),
                     to_ts=Timestamp(asset_movement_timestamp + time_range),
-                    ignored_ids=[str(x) for x in close_match_identifiers] + [str(asset_movement.identifier)],  # noqa: E501
+                    ignored_ids=close_match_identifiers + [asset_movement.identifier],  # type: ignore[arg-type]  # ids from db will not be none
                     assets=assets_in_collection if only_expected_assets else None,
                     entry_types=IncludeExcludeFilterData(
                         values=ENTRY_TYPES_TO_EXCLUDE_FROM_MATCHING,
@@ -3708,6 +3883,8 @@ class RestAPI:
                     asset_movement=asset_movement,  # type: ignore[arg-type]  # will be an asset movement - the query is filtered by entry type
                     event=event,
                     blockchain_accounts=blockchain_accounts,
+                    already_matched_event_ids=already_matched_event_ids,
+                    exclude_protocol_counterparty=False,
                 )
             ],
         }))

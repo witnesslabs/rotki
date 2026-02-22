@@ -34,7 +34,7 @@ from rotkehlchen.exchanges.woo import Woo
 from rotkehlchen.fval import FVal
 from rotkehlchen.globaldb.handler import GlobalDBHandler
 from rotkehlchen.history.events.structures.asset_movement import AssetMovement
-from rotkehlchen.history.events.structures.types import HistoryEventType
+from rotkehlchen.history.events.structures.types import HistoryEventSubType
 from rotkehlchen.tests.utils.constants import A_XMR
 from rotkehlchen.tests.utils.factories import (
     make_api_key,
@@ -526,7 +526,7 @@ def assert_binance_asset_movements_result(
             timestamp=TimestampMS(1508198532000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.RECEIVE,
             asset=A_ETH,
             amount=FVal('0.04670582'),
             extra_data={
@@ -538,7 +538,7 @@ def assert_binance_asset_movements_result(
             timestamp=TimestampMS(1508398632000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.RECEIVE,
             asset=A_XMR,
             amount=FVal('1000'),
             extra_data={
@@ -550,7 +550,7 @@ def assert_binance_asset_movements_result(
             timestamp=TimestampMS(1508198532000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.SPEND,
             asset=A_ETH,
             amount=FVal('0.99'),
             extra_data={
@@ -562,16 +562,15 @@ def assert_binance_asset_movements_result(
             timestamp=TimestampMS(1508198532000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.WITHDRAWAL,
             asset=A_ETH,
             amount=FVal('0.01'),
-            is_fee=True,
+            event_subtype=HistoryEventSubType.FEE,
         ), AssetMovement(
             group_identifier='x',
             timestamp=TimestampMS(1508198532000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.SPEND,
             asset=A_XMR,
             amount=FVal('999.9999'),
             extra_data={
@@ -583,10 +582,9 @@ def assert_binance_asset_movements_result(
             timestamp=TimestampMS(1508198532000),
             location=location,
             location_label=location_label,
-            event_type=HistoryEventType.WITHDRAWAL,
             asset=A_XMR,
             amount=FVal('0.0001'),
-            is_fee=True,
+            event_subtype=HistoryEventSubType.FEE,
         ),
     ]
 
@@ -598,7 +596,7 @@ def assert_binance_asset_movements_result(
         timestamp=TimestampMS(1626144956000),
         location=location,
         location_label=location_label,
-        event_type=HistoryEventType.DEPOSIT,
+        event_subtype=HistoryEventSubType.RECEIVE,
         asset=A_EUR,
         amount=FVal('10.00'),
         extra_data={'transaction_id': '7d76d611-0568-4f43-afb6-24cac7767365'},
@@ -607,7 +605,7 @@ def assert_binance_asset_movements_result(
         timestamp=TimestampMS(1636144956000),
         location=location,
         location_label=location_label,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.SPEND,
         asset=A_EUR,
         amount=FVal('10.00'),
         extra_data={'transaction_id': '8e76d611-0568-4f43-afb6-24cac7767365'},
@@ -616,10 +614,9 @@ def assert_binance_asset_movements_result(
         timestamp=TimestampMS(1636144956000),
         location=location,
         location_label=location_label,
-        event_type=HistoryEventType.WITHDRAWAL,
         asset=A_EUR,
         amount=FVal('0.02'),
-        is_fee=True,
+        event_subtype=HistoryEventSubType.FEE,
     )]
 
 
@@ -1171,7 +1168,7 @@ def mock_exchange_data_in_db(exchange_locations, rotki) -> None:
                     timestamp=TimestampMS(1),
                     location=exchange_location,
                     asset=A_BTC,
-                    event_type=HistoryEventType.DEPOSIT,
+                    event_subtype=HistoryEventSubType.RECEIVE,
                     amount=ONE,
                     notes='boo',
                 )])
@@ -1243,13 +1240,13 @@ TRANSACTIONS_RESPONSE = """{
     "currency": "USDC"
   },
   "created_at": "2024-12-02T14:46:23Z",
-  "id": "5a1a32dc-bfda-5cbf-b625-1a197e699829",
+  "id": "id9",
   "native_amount": {
     "amount": "-9.98",
     "currency": "EUR"
   },
   "resource": "transaction",
-  "resource_path": "/v2/accounts/40e03599-5601-534c-95c2-0db5f5c5e652/transactions/5a1a32dc-bfda-5cbf-b625-1a197e699829",
+  "resource_path": "/v2/accounts/40e03599-5601-534c-95c2-0db5f5c5e652/transactions/id9",
   "status": "completed",
   "trade": {
     "fee": {
@@ -1424,11 +1421,11 @@ TRANSACTIONS_RESPONSE = """{
  "description": null,
  "details": {"header": "Bought 0.05772716 ETH (€10.99)", "health": "positive", "payment_method_name": "1234********7890", "subtitle": "Using 1234********7890", "title": "Bought Ethereum"},
  "hide_native_amount": false,
- "id": "txid-1",
+ "id": "id10",
  "instant_exchange": false,
  "native_amount": {"amount": "10.99", "currency": "EUR"},
  "resource": "transaction",
- "resource_path": "/v2/accounts/accountid-1/transactions/txid-1",
+ "resource_path": "/v2/accounts/accountid-1/transactions/id10",
  "status": "completed",
  "type": "buy",
  "updated_at": "2021-11-08T01:18:26Z"
@@ -1439,11 +1436,11 @@ TRANSACTIONS_RESPONSE = """{
  "description": null,
  "details": {"header": "Sold 0.05772715 ETH (€10.98)", "health": "positive", "payment_method_name": "1234********7890", "subtitle": "Using 1234********7890", "title": "Sold Ethereum"},
  "hide_native_amount": false,
- "id": "txid-2",
+ "id": "id11",
  "instant_exchange": false,
  "native_amount": {"amount": "10.98", "currency": "EUR"},
  "resource": "transaction",
- "resource_path": "/v2/accounts/accountid-1/transactions/txid-2",
+ "resource_path": "/v2/accounts/accountid-1/transactions/id11",
  "status": "completed",
  "type": "sell",
  "updated_at": "2021-12-08T01:18:26Z"

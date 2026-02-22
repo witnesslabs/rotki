@@ -3,13 +3,19 @@ import type { HistoryEventRequestPayload } from '@/modules/history/events/reques
 import type { HistoryEventsTableEmitFn } from '@/modules/history/events/types';
 import type { Collection } from '@/types/collection';
 import type { HistoryEventEntry, HistoryEventRow } from '@/types/history/events/schemas';
+import { HistoryEventEntryType } from '@rotki/common';
+import { startPromise } from '@shared/utils';
 import { flatten } from 'es-toolkit';
 import { useHistoryEvents } from '@/composables/history/events';
 import { useRefWithDebounce } from '@/composables/ref';
+import { RequestCancelledError } from '@/modules/api/request-queue/errors';
+import { api } from '@/modules/api/rotki-api';
 import { useHistoryEventsStatus } from '@/modules/history/events/use-history-events-status';
 import { useIgnoredAssetsStore } from '@/store/assets/ignored';
 import { useFrontendSettingsStore } from '@/store/settings/frontend';
 import { getCollectionData, setupEntryLimit } from '@/utils/collection';
+import { logger } from '@/utils/logging';
+import { useCompleteEvents } from './use-complete-events';
 
 interface UseHistoryEventsDataOptions {
   groups: Ref<Collection<HistoryEventRow>>;
@@ -33,12 +39,32 @@ interface UseHistoryEventsDataReturn {
   showUpgradeRow: ComputedRef<boolean>;
 
   // Event data
-  allEventsMapped: ComputedRef<Record<string, HistoryEventRow[]>>;
+  /**
+   * All events grouped by groupIdentifier, including events with ignored assets.
+   * Only hidden events are excluded. Used for operations like editing and redecoding
+   * where the complete set of events is needed.
+   */
+  completeEventsMapped: ComputedRef<Record<string, HistoryEventRow[]>>;
+  /** Events grouped by groupIdentifier, with both hidden and ignored-asset events filtered out. */
   displayedEventsMapped: ComputedRef<Record<string, HistoryEventRow[]>>;
+  groupsWithHiddenIgnoredAssets: ComputedRef<Set<string>>;
+  groupsShowingIgnoredAssets: Ref<Set<string>>;
   hasIgnoredEvent: ComputedRef<boolean>;
   groups: ComputedRef<HistoryEventEntry[]>;
   events: ComputedRef<HistoryEventEntry[]>;
   rawEvents: Ref<HistoryEventRow[]>;
+  fetchEvents: () => Promise<void>;
+  toggleShowIgnoredAssets: (groupId: string) => void;
+
+  // Complete events helpers
+  getGroupEvents: (groupId: string) => HistoryEventEntry[];
+  getCompleteSubgroupEvents: (displayedEvents: HistoryEventEntry[]) => HistoryEventEntry[];
+  getCompleteEventsForItem: (groupId: string, event: HistoryEventEntry) => HistoryEventEntry[];
+  isSubgroupIncomplete: (displayedEvents: HistoryEventEntry[]) => boolean;
+}
+
+function isSwapOnlyGroup(events: HistoryEventRow[]): events is HistoryEventEntry[] {
+  return events.length > 1 && events.every(e => !Array.isArray(e) && e.entryType === HistoryEventEntryType.SWAP_EVENT);
 }
 
 export function useHistoryEventsData(
@@ -48,6 +74,8 @@ export function useHistoryEventsData(
   const { excludeIgnored, groupLoading, groups, identifiers, pageParams } = options;
 
   const eventsLoading = ref<boolean>(false);
+  const events = ref<HistoryEventRow[]>([]);
+  let fetchVersion = 0;
 
   // Extract collection data
   const { itemsPerPage } = storeToRefs(useFrontendSettingsStore());
@@ -61,33 +89,52 @@ export function useHistoryEventsData(
     get(data).flatMap(item => Array.isArray(item) ? item.map(i => i.groupIdentifier) : item.groupIdentifier),
   );
 
+  const EVENTS_CANCEL_TAG = 'history-events-detail';
+
   // Fetches all events for the currently displayed groups.
   // limit: -1 fetches all matching events, but the scope is bounded by groupIdentifiers
   // which only includes groups visible on the current page.
-  const events: Ref<HistoryEventRow[]> = asyncComputed(async () => {
+  async function fetchEvents(): Promise<void> {
     const groupIds = get(groupIdentifiers);
+    if (groupIds.length === 0) {
+      set(events, []);
+      return;
+    }
 
-    if (groupIds.length === 0)
-      return [];
+    const currentVersion = ++fetchVersion;
+    set(eventsLoading, true);
+    api.cancelByTag(EVENTS_CANCEL_TAG);
 
-    const response = await fetchHistoryEvents({
-      ...get(pageParams),
-      aggregateByGroupIds: false,
-      excludeIgnoredAssets: false,
-      groupIdentifiers: groupIds,
-      identifiers: get(identifiers),
-      limit: -1,
-      offset: 0,
-    });
+    try {
+      const response = await fetchHistoryEvents({
+        ...get(pageParams),
+        aggregateByGroupIds: false,
+        excludeIgnoredAssets: false,
+        groupIdentifiers: groupIds,
+        identifiers: get(identifiers),
+        limit: -1,
+        offset: 0,
+      }, { tags: [EVENTS_CANCEL_TAG] });
 
-    return response.data;
-  }, [], {
-    evaluating: eventsLoading,
-    lazy: true,
-  });
+      if (currentVersion === fetchVersion)
+        set(events, response.data);
+    }
+    catch (error: any) {
+      if (!(error instanceof RequestCancelledError))
+        logger.error(error);
+    }
+    finally {
+      if (currentVersion === fetchVersion)
+        set(eventsLoading, false);
+    }
+  }
 
-  // Groups events by their groupIdentifier, filtering out hidden events
-  const allEventsMapped = computed<Record<string, HistoryEventRow[]>>(() => {
+  /**
+   * All events grouped by groupIdentifier, including events with ignored assets.
+   * Only hidden events are excluded. Used for operations like editing and redecoding
+   * where the complete set of events is needed.
+   */
+  const completeEventsMapped = computed<Record<string, HistoryEventRow[]>>(() => {
     const eventsList = get(events);
     if (eventsList.length === 0)
       return {};
@@ -107,18 +154,47 @@ export function useHistoryEventsData(
       }
     }
 
+    // For swap event groups, the backend doesn't subgroup because all events
+    // in the group are guaranteed to be in the same subgroup. Wrap them as a
+    // single subgroup array so the frontend renders them with HistoryEventsSwapItem.
+    for (const [groupId, groupEvents] of Object.entries(mapping)) {
+      if (isSwapOnlyGroup(groupEvents))
+        mapping[groupId] = [groupEvents];
+    }
+
     return mapping;
   });
 
-  // Derives from allEventsMapped, filtering out ignored assets when excludeIgnored is true
+  // Track which groups have opted to show ignored assets (per-group toggle)
+  const groupsShowingIgnoredAssets = shallowRef<Set<string>>(new Set());
+
+  function toggleShowIgnoredAssets(groupId: string): void {
+    const current = get(groupsShowingIgnoredAssets);
+    const newSet = new Set(current);
+    if (newSet.has(groupId))
+      newSet.delete(groupId);
+    else
+      newSet.add(groupId);
+
+    set(groupsShowingIgnoredAssets, newSet);
+  }
+
+  /** Events grouped by groupIdentifier, with both hidden and ignored-asset events filtered out. */
   const displayedEventsMapped = computed<Record<string, HistoryEventRow[]>>(() => {
-    const base = get(allEventsMapped);
+    const base = get(completeEventsMapped);
     if (!get(excludeIgnored))
       return base;
 
+    const showingIgnored = get(groupsShowingIgnoredAssets);
     const mapping: Record<string, HistoryEventRow[]> = {};
 
     for (const [groupId, groupEvents] of Object.entries(base)) {
+      // If this group is showing ignored assets, include all events
+      if (showingIgnored.has(groupId)) {
+        mapping[groupId] = groupEvents;
+        continue;
+      }
+
       const filtered: HistoryEventRow[] = [];
       for (const event of groupEvents) {
         if (Array.isArray(event)) {
@@ -137,8 +213,66 @@ export function useHistoryEventsData(
     return mapping;
   });
 
-  const loading = useRefWithDebounce(logicOr(groupLoading, eventsLoading), 100);
-  const hasIgnoredEvent = useArraySome(events, event => Array.isArray(event) && event.some(item => item.ignoredInAccounting));
+  const loading = useRefWithDebounce(logicOr(groupLoading, eventsLoading), 200);
+  const hasIgnoredEvent = useArraySome(
+    events,
+    event => Array.isArray(event) ? event.some(item => item.ignoredInAccounting) : event.ignoredInAccounting,
+  );
+
+  function flattenedEventCount(rows: HistoryEventRow[]): number {
+    let count = 0;
+    for (const row of rows)
+      count += Array.isArray(row) ? row.length : 1;
+
+    return count;
+  }
+
+  // Track which groups have events hidden due to ignored assets filter
+  const groupsWithHiddenIgnoredAssets = computed<Set<string>>(() => {
+    if (!get(excludeIgnored))
+      return new Set();
+
+    const all = get(completeEventsMapped);
+    const displayed = get(displayedEventsMapped);
+    const result = new Set<string>();
+
+    for (const groupId of Object.keys(all)) {
+      const allCount = flattenedEventCount(all[groupId] ?? []);
+      const displayedCount = flattenedEventCount(displayed[groupId] ?? []);
+      if (allCount > displayedCount)
+        result.add(groupId);
+    }
+
+    return result;
+  });
+
+  // Map each event identifier to its complete subgroup size for detecting incomplete subgroups
+  const completeSubgroupSizes = computed<Map<number, number>>(() => {
+    const map = new Map<number, number>();
+    for (const groupEvents of Object.values(get(completeEventsMapped))) {
+      for (const event of groupEvents) {
+        if (!Array.isArray(event))
+          continue;
+
+        for (const subEvent of event)
+          map.set(subEvent.identifier, event.length);
+      }
+    }
+    return map;
+  });
+
+  /**
+   * Checks if a displayed subgroup has fewer events than the complete subgroup
+   * (i.e., some events are hidden due to ignored asset filtering).
+   * When true, the subgroup should always be shown expanded without a collapse toggle.
+   */
+  function isSubgroupIncomplete(displayedEvents: HistoryEventEntry[]): boolean {
+    if (displayedEvents.length === 0)
+      return false;
+    const sizes = get(completeSubgroupSizes);
+    const completeSize = sizes.get(displayedEvents[0].identifier);
+    return completeSize !== undefined && completeSize > displayedEvents.length;
+  }
 
   const flattenedGroups = computed<HistoryEventEntry[]>(() => flatten(get(data)));
 
@@ -151,20 +285,41 @@ export function useHistoryEventsData(
     }
   });
 
+  // Cancel stale events fetch as soon as new groups fetch starts
+  watch(groupLoading, (loading) => {
+    if (loading)
+      api.cancelByTag(EVENTS_CANCEL_TAG);
+  });
+
+  // Trigger events fetch when groups change (tied to fetchData completion in pagination filter)
+  watchImmediate(data, () => {
+    startPromise(fetchEvents());
+  });
+
+  const { getCompleteEventsForItem, getCompleteSubgroupEvents, getGroupEvents } = useCompleteEvents(completeEventsMapped);
+
   return {
-    allEventsMapped,
+    completeEventsMapped,
     displayedEventsMapped,
     entriesFoundTotal,
     events: flattenedEvents,
     eventsLoading,
+    fetchEvents,
     found,
+    getCompleteEventsForItem,
+    getCompleteSubgroupEvents,
+    getGroupEvents,
     groups: flattenedGroups,
+    groupsShowingIgnoredAssets,
+    groupsWithHiddenIgnoredAssets,
     hasIgnoredEvent,
+    isSubgroupIncomplete,
     limit,
     loading,
     rawEvents: events,
     sectionLoading,
     showUpgradeRow,
+    toggleShowIgnoredAssets,
     total,
   };
 }

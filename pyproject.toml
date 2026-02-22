@@ -27,7 +27,7 @@ dependencies = [
     "eth-account==0.13.7",
     "eth-typing==5.2.1",
     "content-hash==2.0.0",
-    "rotki-pysqlcipher3==2024.10.1",
+    "sqlcipher3==0.6.2",
     "rotki-sqlite==2025.8.1",
     "requests==2.32.5",
     "urllib3==2.5.0",
@@ -109,9 +109,9 @@ lint = [
     "mypy-extensions==1.1.0",
     "pylint==4.0.4",
     "astroid==4.0.2",  # engine of pylint, upgrade them together
-    "ruff==0.14.14",
+    "ruff==0.15.0",
     "double-indent-rotki==0.1.7",  # our fork of double indent
-    "pyright==1.1.407",
+    "pyright==1.1.408",
     # type packages used by mypy
     # pinned here so that we can have reproducible mypy runs
     "types-chardet==5.0.4.6",
@@ -173,7 +173,7 @@ rotkehlchen_mock = "rotkehlchen_mock.__main__:main"
 # dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools_scm]
-fallback_version = "1.41.3"
+fallback_version = "1.42.0"
 
 [tool.setuptools.package-data]
 "rotkehlchen.data" = ["*"]

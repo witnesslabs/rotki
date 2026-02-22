@@ -68,12 +68,12 @@ const displayAddress = computed<string | undefined>(() => {
     v-if="counterpartyData || displayAddress"
     class="[&_span]:!px-0"
     color="default"
-    offset-x="-6"
+    offset-x="-8"
     offset-y="6"
   >
     <template #icon>
       <RuiTooltip
-        :popper="{ placement: 'top' }"
+        :popper="{ placement: 'top', scroll: false, resize: false }"
         :open-delay="400"
       >
         <template #activator>

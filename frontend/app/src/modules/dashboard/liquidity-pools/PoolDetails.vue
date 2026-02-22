@@ -83,7 +83,7 @@ const sorted = computed<AssetBalanceWithPrice[]>(() => {
     :cols="cols"
     :rows="sorted"
     row-attr="asset"
-    class="bg-white dark:bg-[#1E1E1E] my-2"
+    class="bg-white dark:bg-dark-elevated my-2"
   >
     <template #item.asset="{ row }">
       <AssetDetails :asset="row.asset" />
@@ -92,6 +92,7 @@ const sorted = computed<AssetBalanceWithPrice[]>(() => {
       <FiatDisplay
         v-if="row.usdPrice && row.usdPrice.gte(0)"
         :value="row.usdPrice"
+        :price-asset="row.asset"
         from="USD"
       />
       <span v-else>-</span>

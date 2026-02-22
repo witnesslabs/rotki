@@ -23,6 +23,7 @@ from rotkehlchen.db.constants import (
     HISTORY_BASE_ENTRY_FIELDS,
     HISTORY_MAPPING_KEY_STATE,
     TX_DECODED,
+    HistoryEventLinkType,
     HistoryMappingState,
 )
 from rotkehlchen.errors.serialization import DeserializationError
@@ -45,6 +46,7 @@ from rotkehlchen.types import (
     SolanaAddress,
     SupportedBlockchain,
     Timestamp,
+    TimestampMS,
 )
 from rotkehlchen.utils.misc import ts_now
 
@@ -321,6 +323,7 @@ class DBFilterQuery(ABC):
             with_order: bool = True,
             with_group_by: bool = False,
             without_ignored_asset_filter: bool = False,
+            extra_conditions: list[tuple[str, list[Any]]] | None = None,
     ) -> tuple[str, list[Any]]:
         """Prepares a filter by converting the filters to a query string
 
@@ -333,6 +336,9 @@ class DBFilterQuery(ABC):
         is no need to rerun the ignored assets filter as it's already part of the inner
         query in order to not count ignored/spam assets in the limit of free events.
         TODO: Quite hacky. Improve this.
+        - extra_conditions: Additional SQL conditions (with bindings) to inject into the
+        WHERE clause. Each entry is a (sql_fragment, bindings) tuple. These are appended
+        after the normal filters but before GROUP BY / ORDER BY / PAGINATION.
         """
         query_parts = []
         bindings: list[Any] = []
@@ -354,6 +360,11 @@ class DBFilterQuery(ABC):
             operator = ' AND ' if fil.and_op else ' OR '
             filterstrings.append(f'({operator.join(filters)})')
             bindings.extend(single_bindings)
+
+        if extra_conditions is not None:
+            for condition_sql, condition_bindings in extra_conditions:
+                filterstrings.append(f'({condition_sql})')
+                bindings.extend(condition_bindings)
 
         if len(filterstrings) != 0:
             operator = ' AND ' if self.and_op else ' OR '
@@ -603,6 +614,32 @@ class DBMultiIntegerFilter(DBMultiValueFilter[int]):
 
 
 @dataclass(init=True, repr=True, eq=True, order=False, unsafe_hash=False, frozen=False)
+class DBAssetMovementsMatchFilter(DBFilter):
+    """Batch matching filter for multiple (assets, from_ts_ms, to_ts_ms) tuples."""
+    asset_timestamp_ranges: list[tuple[tuple[Asset, ...], TimestampMS, TimestampMS]]
+
+    def prepare(self) -> tuple[list[str], list[Any]]:
+        or_conditions: list[str] = []
+        bindings: list[Any] = []
+
+        for assets_in_collection, from_ts, to_ts in self.asset_timestamp_ranges:
+            if len(assets_in_collection) == 0:
+                continue
+
+            asset_placeholders = ', '.join(['?'] * len(assets_in_collection))
+            or_conditions.append(
+                f'(asset IN ({asset_placeholders}) AND timestamp >= ? AND timestamp <= ?)',
+            )
+            bindings.extend(asset.identifier for asset in assets_in_collection)
+            bindings.extend((from_ts, to_ts))
+
+        if len(or_conditions) == 0:
+            return [], []
+
+        return [' OR '.join(or_conditions)], bindings
+
+
+@dataclass(init=True, repr=True, eq=True, order=False, unsafe_hash=False, frozen=False)
 class DBOptionalChainAddressesFilter(DBFilter):
     """Filter the address column by a selection of optional chain addresses"""
     optional_chain_addresses: (
@@ -715,28 +752,43 @@ class DBAccountingRuleEventIdFilter(DBFilter):
 
 
 @dataclass(init=True, repr=True, eq=True, order=False, unsafe_hash=False, frozen=False)
-class HistoryEventCustomizedOnlyJoinsFilter(DBFilter):
-    """This join finds customized history events (exclusively)."""
+class HistoryEventStateMarkersJoinsFilter(DBFilter):
+    """This join finds history events with any of the specified state markers."""
+    state_markers: list[HistoryMappingState]
+
     def prepare(self) -> tuple[list[str], list[Any]]:
-        query = (
-            'INNER JOIN history_events_mappings '
-            'ON history_events_mappings.parent_identifier = history_events_identifier '
-            'WHERE history_events_mappings.name = ? AND history_events_mappings.value = ?'
-        )
-        bindings: list[str | int] = [HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED]
+        placeholders = ','.join('?' * len(self.state_markers))
+        bindings: list[str | int] = [
+            HISTORY_MAPPING_KEY_STATE,
+            *[m.serialize_for_db() for m in self.state_markers],
+        ]
+        if HistoryMappingState.MATCHED in self.state_markers:
+            auto_matched_value = HistoryMappingState.MATCHED.serialize_for_db()
+            query = (
+                'WHERE history_events_identifier IN ('
+                'SELECT hem.parent_identifier FROM history_events_mappings hem '
+                f'WHERE hem.name = ? AND hem.value IN ({placeholders})'
+                ' AND NOT EXISTS ('
+                'SELECT 1 FROM history_event_links hel '
+                'WHERE hel.right_event_id = hem.parent_identifier AND hel.link_type = ?'
+                ')'
+                ' UNION '
+                'SELECT hel.left_event_id FROM history_event_links hel '
+                'JOIN history_events_mappings hem ON hem.parent_identifier = hel.right_event_id '
+                'WHERE hem.name = ? AND hem.value = ?'
+                ')'
+            )
+            bindings.extend([
+                HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
+                HISTORY_MAPPING_KEY_STATE, auto_matched_value,
+            ])
+        else:
+            query = (
+                'INNER JOIN history_events_mappings '
+                'ON history_events_mappings.parent_identifier = history_events_identifier '
+                f'WHERE history_events_mappings.name = ? AND history_events_mappings.value IN ({placeholders})'  # noqa: E501
+            )
         return [query], bindings
-
-
-@dataclass(init=True, repr=True, eq=True, order=False, unsafe_hash=False, frozen=False)
-class HistoryEventVirtualOnlyJoinsFilter(DBFilter):
-    """This join finds virtual history events (auto-created profit events during historical balances processing)."""  # noqa: E501
-    def prepare(self) -> tuple[list[str], list[Any]]:
-        query = (
-            'INNER JOIN history_events_mappings '
-            'ON history_events_mappings.parent_identifier = history_events_identifier '
-            'WHERE history_events_mappings.name = ? AND history_events_mappings.value = ?'
-        )
-        return [query], [HISTORY_MAPPING_KEY_STATE, HistoryMappingState.PROFIT_ADJUSTMENT]
 
 
 class HistoryBaseEntryFilterQuery(DBFilterQuery, FilterWithTimestamp, FilterWithLocation, ABC):
@@ -758,22 +810,18 @@ class HistoryBaseEntryFilterQuery(DBFilterQuery, FilterWithTimestamp, FilterWith
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
     ) -> Self:
         """May raise:
         - InvalidFilter for invalid combination of filters
         """
-        if customized_events_only is True and virtual_events_only is True:
-            raise InvalidFilter('Cannot filter by both customized and virtual events')
-
         if order_by_rules is None:
             order_by_rules = [('timestamp', True), ('sequence_index', True)]
 
@@ -784,17 +832,14 @@ class HistoryBaseEntryFilterQuery(DBFilterQuery, FilterWithTimestamp, FilterWith
             order_by_rules=order_by_rules,
             group_by_field='group_identifier',
         )
-        if customized_events_only is True:
+        if state_markers is not None and len(state_markers) > 0:
             if filter_query.join_clause is not None:  # atm "should not happen"
-                raise InvalidFilter('Unable to filter by customized events due to conflicting filter')  # noqa: E501
+                raise InvalidFilter('Unable to filter by state markers due to conflicting filter')
 
-            filter_query.join_clause = HistoryEventCustomizedOnlyJoinsFilter(and_op=True)
-
-        if virtual_events_only is True:
-            if filter_query.join_clause is not None:
-                raise InvalidFilter('Unable to filter by virtual events due to conflicting filter')
-
-            filter_query.join_clause = HistoryEventVirtualOnlyJoinsFilter(and_op=True)
+            filter_query.join_clause = HistoryEventStateMarkersJoinsFilter(
+                and_op=True,
+                state_markers=state_markers,
+            )
 
         filters: list[DBFilter] = []
         if assets is not None:
@@ -959,6 +1004,77 @@ class HistoryEventFilterQuery(HistoryBaseEntryFilterQuery):
         return HISTORY_BASE_ENTRY_FIELDS
 
 
+class AssetMovementMatchFilterQuery(HistoryEventFilterQuery):
+    """Filter query used to fetch candidate events for multiple asset movements."""
+
+    @classmethod
+    def make(
+            cls,
+            and_op: bool = True,
+            order_by_rules: list[tuple[str, bool]] | None = None,
+            limit: int | None = None,
+            offset: int | None = None,
+            from_ts: Timestamp | None = None,
+            to_ts: Timestamp | None = None,
+            assets: tuple[Asset, ...] | None = None,
+            event_types: list[HistoryEventType] | None = None,
+            event_subtypes: list[HistoryEventSubType] | None = None,
+            type_and_subtype_combinations: Iterable[tuple[HistoryEventType, HistoryEventSubType]] | None = None,  # noqa: E501
+            exclude_subtypes: list[HistoryEventSubType] | None = None,
+            location: Location | None = None,
+            location_labels: list[str] | None = None,
+            excluded_locations: list[Location] | None = None,
+            ignored_ids: list[int] | None = None,
+            null_columns: list[str] | None = None,
+            identifiers: list[int] | None = None,
+            group_identifiers: list[str] | None = None,
+            entry_types: IncludeExcludeFilterData | None = None,
+            exclude_ignored_assets: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
+            notes_substring: str | None = None,
+            asset_timestamp_ranges: list[tuple[tuple[Asset, ...], TimestampMS, TimestampMS]] | None = None,  # noqa: E501
+            entry_types_to_exclude: list[HistoryBaseEntryType] | None = None,
+    ) -> Self:
+        if asset_timestamp_ranges is None:
+            asset_timestamp_ranges = []
+        if entry_types_to_exclude is None:
+            entry_types_to_exclude = []
+
+        filter_query = super().make(
+            and_op=and_op,
+            order_by_rules=order_by_rules,
+            limit=limit,
+            offset=offset,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            assets=assets,
+            event_types=event_types,
+            event_subtypes=event_subtypes,
+            type_and_subtype_combinations=type_and_subtype_combinations,
+            exclude_subtypes=exclude_subtypes,
+            location=location,
+            location_labels=location_labels,
+            excluded_locations=excluded_locations,
+            ignored_ids=ignored_ids,
+            null_columns=null_columns,
+            identifiers=identifiers,
+            group_identifiers=group_identifiers,
+            entry_types=entry_types if entry_types is not None else IncludeExcludeFilterData(
+                values=entry_types_to_exclude,
+                operator='NOT IN',
+            ),
+            exclude_ignored_assets=exclude_ignored_assets,
+            state_markers=state_markers,
+            notes_substring=notes_substring,
+        )
+        if len(asset_timestamp_ranges) != 0:
+            filter_query.filters.append(DBAssetMovementsMatchFilter(
+                and_op=True,
+                asset_timestamp_ranges=asset_timestamp_ranges,
+            ))
+        return filter_query
+
+
 class HistoryEventWithTxRefFilterQuery(HistoryBaseEntryFilterQuery):
     """Filter for events with a transaction reference."""
     @classmethod
@@ -978,14 +1094,13 @@ class HistoryEventWithTxRefFilterQuery(HistoryBaseEntryFilterQuery):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             tx_refs: list[EVMTxHash | BTCTxId | Signature] | None = None,
     ) -> Self:
@@ -1019,8 +1134,7 @@ class HistoryEventWithTxRefFilterQuery(HistoryBaseEntryFilterQuery):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
         )
         if tx_refs is not None and len(tx_refs) > 0:
@@ -1107,14 +1221,13 @@ class HistoryEventWithCounterpartyFilterQuery(HistoryEventWithTxRefFilterQuery):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             tx_refs: list[EVMTxHash | BTCTxId | Signature] | None = None,
             counterparties: list[str] | None = None,
@@ -1149,8 +1262,7 @@ class HistoryEventWithCounterpartyFilterQuery(HistoryEventWithTxRefFilterQuery):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
             tx_refs=tx_refs,
         )
@@ -1191,14 +1303,13 @@ class SolanaEventFilterQuery(HistoryEventWithCounterpartyFilterQuery):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             signatures: list[Signature] | None = None,
             counterparties: list[str] | None = None,
@@ -1231,8 +1342,7 @@ class SolanaEventFilterQuery(HistoryEventWithCounterpartyFilterQuery):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
             counterparties=counterparties,
         )
@@ -1302,14 +1412,13 @@ class EvmEventFilterQuery(HistoryEventWithCounterpartyFilterQuery):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             tx_hashes: list[EVMTxHash] | None = None,
             counterparties: list[str] | None = None,
@@ -1340,8 +1449,7 @@ class EvmEventFilterQuery(HistoryEventWithCounterpartyFilterQuery):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
             counterparties=counterparties,
         )
@@ -1421,14 +1529,13 @@ class EthStakingEventFilterQuery(HistoryBaseEntryFilterQuery, ABC):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             validator_indices: list[int] | None = None,
     ) -> Self:
@@ -1457,8 +1564,7 @@ class EthStakingEventFilterQuery(HistoryBaseEntryFilterQuery, ABC):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
         )
         if validator_indices is not None:
@@ -1505,14 +1611,13 @@ class EthWithdrawalFilterQuery(EthStakingEventFilterQuery):
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             notes_substring: str | None = None,
             validator_indices: list[int] | None = None,
             withdrawal_types_filter: WithdrawalTypesFilter = WithdrawalTypesFilter.ALL,
@@ -1542,8 +1647,7 @@ class EthWithdrawalFilterQuery(EthStakingEventFilterQuery):
             group_identifiers=group_identifiers,
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
             notes_substring=notes_substring,
             validator_indices=validator_indices,
         )
@@ -1587,14 +1691,13 @@ class EthDepositEventFilterQuery(EvmEventFilterQuery, EthStakingEventFilterQuery
             location: Location | None = None,
             location_labels: list[str] | None = None,
             excluded_locations: list[Location] | None = None,
-            ignored_ids: list[str] | None = None,
+            ignored_ids: list[int] | None = None,
             null_columns: list[str] | None = None,
             identifiers: list[int] | None = None,
             group_identifiers: list[str] | None = None,
             entry_types: IncludeExcludeFilterData | None = None,
             exclude_ignored_assets: bool = False,
-            customized_events_only: bool = False,
-            virtual_events_only: bool = False,
+            state_markers: list[HistoryMappingState] | None = None,
             tx_hashes: list[EVMTxHash] | None = None,
             validator_indices: list[int] | None = None,
     ) -> 'EthDepositEventFilterQuery':
@@ -1624,8 +1727,7 @@ class EthDepositEventFilterQuery(EvmEventFilterQuery, EthStakingEventFilterQuery
             entry_types=entry_types,
             exclude_ignored_assets=exclude_ignored_assets,
             tx_hashes=tx_hashes,
-            customized_events_only=customized_events_only,
-            virtual_events_only=virtual_events_only,
+            state_markers=state_markers,
         )
         if validator_indices is not None:
             filter_query.filters.append(DBMultiIntegerFilter(
@@ -2518,6 +2620,7 @@ class HistoricalBalancesFilterQuery(DBFilterQuery, FilterWithTimestamp):
             with_order: bool = False,
             with_group_by: bool = False,
             without_ignored_asset_filter: bool = False,
+            extra_conditions: list[tuple[str, list[Any]]] | None = None,
     ) -> tuple[str, list[Any]]:
         """Prepare filters for the event_metrics query.
 
@@ -2529,6 +2632,7 @@ class HistoricalBalancesFilterQuery(DBFilterQuery, FilterWithTimestamp):
             with_order=with_order,
             with_group_by=with_group_by,
             without_ignored_asset_filter=without_ignored_asset_filter,
+            extra_conditions=extra_conditions,
         )
         if filter_str.startswith('WHERE '):
             filter_str = 'AND ' + filter_str[6:]

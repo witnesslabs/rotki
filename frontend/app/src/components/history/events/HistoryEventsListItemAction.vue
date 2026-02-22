@@ -6,7 +6,6 @@ import type {
   HistoryEvent,
   HistoryEventEntry,
 } from '@/types/history/events/schemas';
-import { HistoryEventEntryType } from '@rotki/common';
 import RowActions from '@/components/helper/RowActions.vue';
 import HistoryEventAction from '@/components/history/events/HistoryEventAction.vue';
 import {
@@ -22,9 +21,14 @@ import {
 const props = defineProps<{
   item: HistoryEventEntry;
   index: number;
-  events: HistoryEventEntry[];
+  /**
+   * All events in the same group, including hidden and ignored events.
+   * This complete set is required for correctly editing grouped events (e.g., swap events).
+   */
+  completeGroupEvents: HistoryEventEntry[];
   canUnlink?: boolean;
   collapsed?: boolean;
+  collapseAction?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -35,6 +39,8 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n({ useScope: 'global' });
+
+const COLLAPSE_ACTION_CLASSES = 'w-0 group-hover/row:w-auto 2xl:!w-24 2xl:opacity-0 2xl:group-hover/row:opacity-100 2xl:focus-within:opacity-100';
 
 const { item } = toRefs(props);
 
@@ -49,14 +55,20 @@ function hideEditDeleteActions(item: HistoryEventEntry, index: number): boolean 
 function getEmittedEvent(item: HistoryEvent): HistoryEventEditData {
   if (isSwapTypeEvent(item.entryType)) {
     return {
-      eventsInGroup: props.events as GroupEditableHistoryEvents[],
+      eventsInGroup: props.completeGroupEvents as GroupEditableHistoryEvents[],
       type: 'edit-group',
     };
   }
 
   if (isGroupEditableHistoryEvent(item)) {
+    const idx = props.completeGroupEvents.findIndex(e => e.identifier === item.identifier);
+    const eventsInGroup: GroupEditableHistoryEvents[] = [item];
+    const nextEvent = props.completeGroupEvents[idx + 1];
+    if (nextEvent && isAssetMovementEvent(nextEvent) && nextEvent.eventSubtype === 'fee')
+      eventsInGroup.push(nextEvent);
+
     return {
-      eventsInGroup: props.events.filter(e => e.entryType === HistoryEventEntryType.ASSET_MOVEMENT_EVENT) as GroupEditableHistoryEvents[],
+      eventsInGroup,
       type: 'edit-group',
     };
   }
@@ -72,14 +84,14 @@ function editEvent(item: HistoryEvent) {
 }
 
 function deleteEvent(item: HistoryEventEntry) {
-  const isSingleEvmEvent = isEvmEvent(item) && props.events.length === 1;
+  const isSingleEvmEvent = isEvmEvent(item) && props.completeGroupEvents.length === 1;
   const payload: HistoryEventDeletePayload = isSingleEvmEvent
     ? {
         event: item,
         type: 'ignore',
       }
     : {
-        ids: isGroupEditableHistoryEvent(item) || isSwapTypeEvent(item.entryType) ? props.events.map(event => event.identifier) : [item.identifier],
+        ids: isGroupEditableHistoryEvent(item) || isSwapTypeEvent(item.entryType) ? props.completeGroupEvents.map(event => event.identifier) : [item.identifier],
         type: 'delete',
       };
 
@@ -88,10 +100,19 @@ function deleteEvent(item: HistoryEventEntry) {
 </script>
 
 <template>
-  <div class="flex items-center gap-1 justify-end">
+  <div
+    class="flex items-center gap-1 justify-end"
+    :class="{
+      'transition-opacity overflow-hidden 2xl:overflow-visible': collapseAction,
+      [COLLAPSE_ACTION_CLASSES]: collapseAction && !hasMissingRule,
+    }"
+  >
     <!-- Edit/Delete/Other actions - hidden on default when missing rule, visible on hover -->
     <RowActions
-      :class="{ 'opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity': hasMissingRule }"
+      :class="{
+        'opacity-0 group-hover/row:opacity-100 focus-within:opacity-100 transition-opacity': hasMissingRule && !collapseAction,
+        [COLLAPSE_ACTION_CLASSES]: hasMissingRule && collapseAction,
+      }"
       align="end"
       :delete-tooltip="t('transactions.events.actions.delete')"
       :edit-tooltip="t('transactions.events.actions.edit')"

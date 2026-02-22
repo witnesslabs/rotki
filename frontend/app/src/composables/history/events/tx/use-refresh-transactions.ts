@@ -6,12 +6,13 @@ import { useRefreshHandlers } from '@/composables/history/events/tx/refresh-hand
 import { useHistoryTransactionAccounts } from '@/composables/history/events/tx/use-history-transaction-accounts';
 import { useTransactionSync } from '@/composables/history/events/tx/use-transaction-sync';
 import { useSupportedChains } from '@/composables/info/chains';
+import { useSchedulerState } from '@/composables/session/use-scheduler-state';
 import { useStatusUpdater } from '@/composables/status';
+import { useExchangeData } from '@/modules/balances/exchanges/use-exchange-data';
 import { useHistoryStore } from '@/store/history';
 import { useEventsQueryStatusStore } from '@/store/history/query-status/events-query-status';
 import { useTxQueryStatusStore } from '@/store/history/query-status/tx-query-status';
 import { useHistoryRefreshStateStore } from '@/store/history/refresh-state';
-import { useSessionSettingsStore } from '@/store/settings/session';
 import { OnlineHistoryEventsQueryType } from '@/types/history/events/schemas';
 import { Section, Status } from '@/types/status';
 import { LimitedParallelizationQueue } from '@/utils/limited-parallelization-queue';
@@ -34,6 +35,7 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
 
   const { syncTransactionsByChains } = useTransactionSync();
   const { queryAllExchangeEvents, queryOnlineEvent } = useRefreshHandlers();
+  const { onHistoryFinished, onHistoryStarted } = useSchedulerState();
 
   const {
     addPendingAccounts,
@@ -49,12 +51,18 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
     startRefresh,
   } = useHistoryRefreshStateStore();
 
+  const { syncingExchanges, isSameExchange } = useExchangeData();
+
   const refreshTransactions = async (params: RefreshTransactionsParams = {}): Promise<void> => {
     const { chains = [], disableEvmEvents = false, payload = {}, userInitiated = false } = params;
     const { accounts, exchanges, queries } = payload;
     const fullRefresh = Object.keys(payload).length === 0;
 
-    const { connectedExchanges } = storeToRefs(useSessionSettingsStore());
+    const usedExchanges: Exchange[] = exchanges
+      ? exchanges.filter(exchange => get(syncingExchanges).some(
+          syncing => isSameExchange(syncing, exchange),
+        ))
+      : get(syncingExchanges);
 
     // Determine initial accounts to check
     const allCurrentAccounts = accounts?.length
@@ -67,8 +75,7 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
     const hasNewAccounts = newAccountsList.length > 0;
 
     // Check for new exchanges
-    const allCurrentExchanges = exchanges || get(connectedExchanges);
-    const newExchangesList = getNewExchanges(allCurrentExchanges);
+    const newExchangesList = getNewExchanges(usedExchanges);
     const hasNewExchanges = newExchangesList.length > 0;
 
     // Skip refresh only if fetchDisabled returns true AND there are no new accounts or exchanges
@@ -96,7 +103,7 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
       if (hasNewAccounts || userInitiated) {
         accountsToRefresh = getAllAccounts(chains);
       }
-      exchangesToRefresh = get(connectedExchanges);
+      exchangesToRefresh = get(syncingExchanges);
     }
     else if (hasNewAccounts || hasNewExchanges) {
       if (hasNewAccounts)
@@ -121,6 +128,7 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
 
     if (accountsToRefresh.length > 0 || exchangesToRefresh.length > 0) {
       startRefresh(accountsToRefresh, exchangesToRefresh);
+      onHistoryStarted();
       if (accountsToRefresh.length > 0 && shouldShowSyncProgress) {
         initializeQueryStatus(decodableAccounts);
         resetUndecodedTransactionsStatus();
@@ -143,8 +151,8 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
 
       if (fullRefresh || exchanges) {
         if (shouldShowSyncProgress)
-          initializeExchangeEventsQueryStatus(exchanges || get(connectedExchanges));
-        asyncOperations.push(queryAllExchangeEvents(exchanges));
+          initializeExchangeEventsQueryStatus(usedExchanges);
+        asyncOperations.push(queryAllExchangeEvents(usedExchanges));
       }
 
       const queriesToExecute: OnlineHistoryEventsQueryType[] | undefined = fullRefresh || disableEvmEvents
@@ -174,6 +182,7 @@ export function useRefreshTransactions(): UseRefreshTransactionsReturn {
     finally {
       finishRefresh();
       setStatus(Status.LOADED);
+      onHistoryFinished();
     }
 
     // After refresh is complete, check if there are pending accounts or exchanges to refresh

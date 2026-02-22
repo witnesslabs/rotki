@@ -1469,6 +1469,50 @@ Trigger an async task
         :statuscode 500: Internal Rotki error
 
 
+Enable or disable the periodic task scheduler
+=============================================
+
+.. http:put:: /api/(version)/tasks/scheduler
+
+      Enables or disables the periodic task scheduler. This should be called by the frontend
+      once initial data loading is complete (transaction decoding, balances fetch, asset
+      movement matching, historical balance processing). This ensures background tasks that
+      require exclusive database write access (like backup sync) don't run during DB upgrades,
+      migrations, and asset updates.
+
+      **Example Request:**
+
+        .. http:example:: curl wget httpie python-requests
+
+          PUT /api/(version)/tasks/scheduler HTTP/1.1
+          Host: localhost:5042
+          Content-Type: application/json;charset=UTF-8
+
+          {"enabled": true}
+
+        :reqjson bool enabled: Whether to enable (true) or disable (false) the scheduler.
+
+      **Example Response:**
+
+        .. sourcecode:: http
+
+          HTTP/1.1 200 OK
+          Content-Type: application/json
+
+          {
+            "message": "",
+            "result": {
+              "enabled": true
+            },
+            "status_code": 200
+          }
+
+        :resjson object result: Object containing the new scheduler state
+        :statuscode 200: Operation completed successfully
+        :statuscode 401: User is not logged in
+        :statuscode 500: Internal Rotki error
+
+
 Query the latest price of assets
 ===================================
 
@@ -5201,8 +5245,7 @@ Dealing with History Events
    :reqjson int limit: This signifies the limit of records to return as per the `sql spec <https://www.sqlite.org/lang_select.html#limitoffset>`__.
    :reqjson int offset: This signifies the offset from which to start the return of records per the `sql spec <https://www.sqlite.org/lang_select.html#limitoffset>`__.
    :reqjson object otherargs: Check the documentation of the remaining arguments `here <filter-request-args-label_>`_.
-   :reqjson bool customized_events_only: Optional. If enabled the search is performed only for manually customized events. Default false. Mutually exclusive with ``virtual_events_only``.
-   :reqjson bool virtual_events_only: Optional. If enabled the search is performed only for virtual events (auto-created profit events during historical balances processing). Default false. Mutually exclusive with ``customized_events_only``.
+   :reqjson list[string] state_markers: Optional. A list of state markers to filter events by. Events matching any of the specified markers will be returned. Valid values are ``customized``, ``profit adjustment``, ``matched``, ``imported from csv``. If not provided, no marker filtering is applied.
 
    **Example Response**:
 
@@ -5515,7 +5558,7 @@ Dealing with History Events
    :resjson bool events[].entry.is_exit: Eth withdrawal event key. A boolean denoting if the withdrawal is a full exit or not.
    :resjson int events[].entry.block_number: Eth block event key. An integer representing the number of the block for which the event is made.
    :resjson object events[].entry.extra_data: Optional. Additional data specific to the event type.
-   :resjson list events[].states: Optional. List of state tags for the event. Valid states are ``customized``, ``profit_adjustment``, ``auto_matched``, ``imported_from_csv``.
+   :resjson list events[].states: Optional. List of state tags for the event. Valid states are ``customized``, ``profit adjustment``, ``matched``, ``imported from csv``.
    :resjson bool events[].hidden: Optional. If true, this event should be hidden in the UI due to consolidation of events.
    :resjson bool events[].ignored_in_accounting: Set to true when the user has marked this event as ignored.
    :resjson bool events[].has_ignored_assets: Optional. Set to true when the event group contains ignored assets, indicating that some events may have been excluded by ignored assets filtering.
@@ -5757,7 +5800,7 @@ Dealing with History Events
 
             {
                 "entry_type": "asset movement event",
-                "event_type": "deposit",
+                "event_subtype": "receive",
                 "timestamp": 1569924574,
                 "amount": "0.5",
                 "asset": "ETH",
@@ -5770,7 +5813,7 @@ Dealing with History Events
                 "group_identifier": "AM_xxxxxxxxxx"
             }
 
-         :reqjson string event_type: The type of asset movement event ("deposit" or "withdrawal")
+         :reqjson string event_subtype: The direction subtype of the movement. Must be ``"receive"`` or ``"spend"``.
          :reqjson object amount: The amount being moved.
          :reqjson string asset: The identifier of the asset being moved (e.g. "ETH", "BTC")
          :reqjson string location: The location/exchange where the movement occurred
@@ -6372,11 +6415,11 @@ Match exchange asset movements with onchain events
 
       {
           "asset_movement": 123,
-          "matched_event": 124
+          "matched_events": [124]
       }
 
    :reqjson int asset_movement: DB identifier of the asset movement to match
-   :reqjson int[optional] matched_event: DB identifier of the corresponding event to match with the asset movement. The asset movement is marked as having no match if this parameter is omitted or set to null.
+   :reqjson list[int][optional] matched_events: List of DB identifiers of events to match with the asset movement. The asset movement is marked as having no match if this parameter is omitted or an empty list.
 
    **Example Response**:
 
@@ -6492,10 +6535,10 @@ Match exchange asset movements with onchain events
       Content-Type: application/json;charset=UTF-8
 
       {
-          "asset_movement": 123
+          "identifier": 123
       }
 
-   :reqjson int asset_movement: DB identifier of the asset movement to unlink
+   :reqjson int identifier: DB identifier of an asset movement or an event matched with an asset movement to unlink.
 
    **Example Response**:
 
@@ -6546,6 +6589,9 @@ Customized history event duplicates
               ],
               "manual_review_group_ids": [
                   "0xa8e4c2f6b79a1b9d6288a763dc6243cbce1e2c35c8b65ec79a9d35a1f4ec6a20"
+              ],
+              "ignored_group_ids": [
+                  "0xc3d7e1a5b2f84096dab8e3c7f1a294d5e6b83c71f9a0d2e4b5c6d7e8f9a0b1c2"
               ]
           },
           "message": ""
@@ -6554,6 +6600,7 @@ Customized history event duplicates
    :reqquery bool[optional] async_query: Whether to execute as an async task.
    :resjson list result.auto_fix_group_ids: Group identifiers where a customized EVM/Solana event has a non-customized duplicate that only differs by sequence index.
    :resjson list result.manual_review_group_ids: Group identifiers where customized and non-customized EVM/Solana events share asset and direction but are not exact matches.
+   :resjson list result.ignored_group_ids: Group identifiers that have been marked as ignored false positives.
    :resjson str message: Error message if any errors occurred.
    :statuscode 200: Group identifiers returned successfully
    :statuscode 401: No user is currently logged in
@@ -6578,6 +6625,9 @@ Customized history event duplicates
           ]
       }
 
+   :reqquery bool[optional] async_query: Whether to execute as an async task.
+   :reqjson list[optional] group_identifiers: Optional list of group identifiers to auto-fix. If omitted, all auto-fixable groups are processed.
+
    **Example Response**:
 
    .. sourcecode:: http
@@ -6596,8 +6646,6 @@ Customized history event duplicates
           "message": ""
       }
 
-   :reqquery bool[optional] async_query: Whether to execute as an async task.
-   :reqjson list[optional] group_identifiers: Optional list of group identifiers to auto-fix. If omitted, all auto-fixable groups are processed.
    :resjson list result.removed_event_identifiers: Event identifiers removed by the auto-fix operation.
    :resjson list result.auto_fix_group_ids: Remaining auto-fixable group identifiers after removal.
    :resjson list result.manual_review_group_ids: Remaining manual review group identifiers after removal.
@@ -6605,6 +6653,92 @@ Customized history event duplicates
    :statuscode 200: Auto-fix operation completed successfully
    :statuscode 401: No user is currently logged in
    :statuscode 409: Auto-fix failed due to a deletion constraint
+   :statuscode 500: Internal rotki error
+
+.. http:put:: /api/(version)/history/events/duplicates/customized
+
+   Mark the given group identifiers as ignored false positives. Returns the current list of all ignored group identifiers.
+
+   Supports async execution via the `async_query` query parameter.
+
+   **Example Request**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      PUT /api/1/history/events/duplicates/customized HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {
+          "group_identifiers": [
+              "0x7f9b1d9b3d6c80b6f699a25f3e91c408155cbff965d0f3a0df4d3a4f8f4b73c7"
+          ]
+      }
+
+   :reqquery bool[optional] async_query: Whether to execute as an async task.
+   :reqjson list group_identifiers: List of group identifiers to mark as ignored false positives. Must contain at least one entry.
+
+   **Example Response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {
+          "result": [
+              "0x7f9b1d9b3d6c80b6f699a25f3e91c408155cbff965d0f3a0df4d3a4f8f4b73c7"
+          ],
+          "message": ""
+      }
+
+   :resjson list result: All currently ignored group identifiers.
+   :resjson str message: Error message if any errors occurred.
+   :statuscode 200: Groups ignored successfully
+   :statuscode 400: Provided group identifiers are already ignored
+   :statuscode 401: No user is currently logged in
+   :statuscode 500: Internal rotki error
+
+.. http:delete:: /api/(version)/history/events/duplicates/customized
+
+   Remove the ignored false positive markers for the given group identifiers. Returns the current list of all ignored group identifiers.
+
+   Supports async execution via the `async_query` query parameter.
+
+   **Example Request**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      DELETE /api/1/history/events/duplicates/customized HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {
+          "group_identifiers": [
+              "0x7f9b1d9b3d6c80b6f699a25f3e91c408155cbff965d0f3a0df4d3a4f8f4b73c7"
+          ]
+      }
+
+   :reqquery bool[optional] async_query: Whether to execute as an async task.
+   :reqjson list group_identifiers: List of group identifiers to un-ignore. Must contain at least one entry.
+
+   **Example Response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {
+          "result": [],
+          "message": ""
+      }
+
+   :resjson list result: All currently ignored group identifiers after removal.
+   :resjson str message: Error message if any errors occurred.
+   :statuscode 200: Groups un-ignored successfully
+   :statuscode 400: Provided group identifiers are not currently ignored
+   :statuscode 401: No user is currently logged in
    :statuscode 500: Internal rotki error
 
 Querying messages to show to the user
@@ -6973,65 +7107,6 @@ Import Accounting rules
    :statuscode 500: Internal rotki error.
 
 
-Export action history to CSV
-================================
-
-.. http:get:: /api/(version)/history/export
-
-   .. note::
-      This endpoint also accepts parameters as query arguments.
-
-   Doing a GET on the history export endpoint will export the last previously queried history to CSV files and save them in the given directory. If history has not been queried before an error is returned.
-
-   **Example Request**:
-
-   .. http:example:: curl wget httpie python-requests
-
-      GET /api/1/history/export HTTP/1.1
-      Host: localhost:5042
-      Content-Type: application/json;charset=UTF-8
-
-      {"directory_path": "/home/username/path/to/csvdir"}
-
-   :reqjson str directory_path: The directory in which to write the exported CSV files
-   :param str directory_path: The directory in which to write the exported CSV files
-
-   **Example Response**:
-
-   .. sourcecode:: http
-
-      HTTP/1.1 200 OK
-      Content-Type: application/json
-
-      {
-          "result": true
-          "message": ""
-      }
-
-   :resjson bool result: Boolean denoting success or failure of the query
-   :statuscode 200: File were exported successfully
-   :statuscode 400: Provided JSON is in some way malformed or given string is not a directory.
-   :statuscode 409: No user is currently logged in. No history has been processed. No permissions to write in the given directory. Check error message.
-   :statuscode 500: Internal rotki error.
-
-
-Download action history CSV
-================================
-
-.. http:get:: /api/(version)/history/download
-
-
-   Doing a GET on the history download endpoint will download the last previously queried history to CSV files and return it in a zip file. If history has not been queried before an error is returned.
-
-   **Example Request**:
-
-   .. http:example:: curl wget httpie python-requests
-
-      GET /api/1/history/download HTTP/1.1
-      Host: localhost:5042
-      Content-Type: application/json;charset=UTF-8
-
-
 Get missing acquisitions and prices
 ====================================
 
@@ -7384,6 +7459,70 @@ Get saved events of a PnL Report
    :statuscode 400: Report id does not exist.
    :statuscode 409: No user is currently logged in.
    :statuscode 500: Internal rotki error.
+
+Export PnL report CSV
+======================
+
+.. http:get:: /api/(version)/reports/(report_id)/export
+
+   .. note::
+      This exports the CSV for a specific saved PnL report using data from the
+      transient DB, so it works after app restart.
+
+   Doing a GET on this endpoint will export the PnL report for the given report id
+   to CSV files and save them in the given directory.
+
+   **Example Request**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      GET /api/1/reports/4/export HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {"directory_path": "/home/username/path/to/csvdir"}
+
+   :reqjson str directory_path: The directory in which to write the exported CSV files
+   :param str directory_path: The directory in which to write the exported CSV files
+
+   **Example Response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {
+          "result": true,
+          "message": ""
+      }
+
+   :resjson bool result: Boolean denoting success or failure of the export
+   :statuscode 200: File exported successfully
+   :statuscode 409: No user is currently logged in. Report not found. No permissions to write in the given directory. Check error message.
+   :statuscode 500: Internal rotki error.
+
+
+Download PnL report CSV
+========================
+
+.. http:get:: /api/(version)/reports/(report_id)/download
+
+   .. note::
+      This downloads the CSV for a specific saved PnL report using data from the
+      transient DB, so it works after app restart.
+
+   Doing a GET on this endpoint will download the PnL report for the given report id
+   as a zip file. If no report exists, an error is returned.
+
+   **Example Request**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      GET /api/1/reports/4/download HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
 
 Purge PnL report and all its data
 ====================================
@@ -12701,6 +12840,45 @@ Events Details
    :statuscode 500: Internal rotki error.
 
 
+Event Group Position
+=======================
+
+.. http:get:: /api/(version)/history/events/position
+
+   Doing a GET on this endpoint will return the 0-based position of a history event group in the filtered and sorted list of groups. This is useful for navigating to a specific event in paginated views.
+
+   **Example Request**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      GET /api/1/history/events/position HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {"group_identifier": "10x1234567890abcdef"}
+
+   :reqjson string group_identifier: The group identifier of the event group to find the position of.
+
+   **Example Response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {
+          "result": 42,
+          "message": ""
+      }
+
+   :resjson int result: The 0-based position of the group in the filtered and sorted list of groups. Returns null if the group is not found.
+
+   :statuscode 200: The position was returned successfully.
+   :statuscode 400: Provided JSON is in some way malformed.
+   :statuscode 401: No user is currently logged in.
+   :statuscode 500: Internal rotki error.
+
+
 Get Binance Savings Interests History
 =======================================
 
@@ -14396,12 +14574,12 @@ Historical Balance Queries
 
   .. http:post:: /api/(version)/balances/historical/asset
 
-    Gets historical balance amounts for a specific asset within a given time range, calculated from pre-computed balance metrics.
+    Gets historical balance amounts for a specific asset within a given time range, calculated from processing of historical events.
     It's the total amount of asset held at each timestamp where a change occurred.
 
-    The response includes a ``processing_required`` flag that indicates whether historical events exist but haven't
-    been processed yet. If ``processing_required`` is true, call ``POST /tasks/trigger`` to trigger
-    processing, then retry this endpoint.
+    .. note::
+        If processing reveals a negative total balance amount at any point, the response will include amounts up to
+        the event that caused the negative balance. No amounts after this point are returned.
 
     **Example Request:**
 
@@ -14422,7 +14600,7 @@ Historical Balance Queries
       :reqjsonarr integer from_timestamp: The start timestamp of the query range
       :reqjsonarr integer to_timestamp: The end timestamp of the query range
 
-    **Example Response (data available):**
+    **Example Response:**
 
       .. sourcecode:: http
 
@@ -14432,46 +14610,15 @@ Historical Balance Queries
         {
           "message": "",
           "result": {
-            "processing_required": false,
             "times": [1672531200, 1673308800, 1674518400],
             "values": ["1.5", "2.0", "1.8"]
           },
           "status_code": 200
         }
 
-    **Example Response (processing required):**
-
-      .. sourcecode:: http
-
-        HTTP/1.1 200 OK
-        Content-Type: application/json
-
-        {
-          "message": "",
-          "result": {
-            "processing_required": true
-          },
-          "status_code": 200
-        }
-
-    **Example Response (no events in range):**
-
-      .. sourcecode:: http
-
-        HTTP/1.1 200 OK
-        Content-Type: application/json
-
-        {
-          "message": "",
-          "result": {
-            "processing_required": false
-          },
-          "status_code": 200
-        }
-
-        :resjson bool processing_required: True if events exist but haven't been processed yet. False otherwise.
-        :resjson list[integer] times: Timestamps of balance changes. Only present when data is available.
-        :resjson list[string] values: Net asset balance amount at each corresponding timestamp. Only present when data is available.
+        :resjson list[integer] times: Timestamps of balance changes.
+        :resjson list last_group_identifier: (Optional) A list containing [identifier, group_identifier] of the event that caused the negative balance amount.
+        :resjson list[string] values: Net asset balance amount at each corresponding timestamp.
         :statuscode 200: Historical balances returned
         :statuscode 400: Malformed query
         :statuscode 401: User is not logged in
@@ -15047,6 +15194,96 @@ Ethereum staking events
    :statuscode 200: Redecode operation completed successfully.
    :statuscode 400: Failed to validate the data or invalid entry type provided.
    :statuscode 401: No user is currently logged in.
+   :statuscode 500: Internal rotki error.
+
+Refetch ETH staking events
+===================================
+
+.. http:post:: /api/(version)/blockchains/eth2/events/refetch
+
+   Doing a POST on this endpoint will force a re-query of ETH staking events (block productions or withdrawals) for the specified validators or addresses. This is useful to recover potentially missed events due to indexer errors or other temporary failures.
+
+   For block production events, beaconcha.in does not support time range filtering, so all blocks for the targeted validators are re-queried regardless of the provided time range. This operation can be expensive in terms of API usage.
+
+   For withdrawal events, etherscan is queried for the specified time range.
+
+   Existing events are not deleted. Duplicates are handled automatically.
+
+   .. note::
+      This endpoint can also be queried asynchronously by using ``"async_query": true``
+
+   **Example Request (block productions by validator indices)**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      POST /api/1/blockchains/eth2/events/refetch HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {"async_query": false, "entry_type": "block productions", "validator_indices": [12345, 67890]}
+
+   **Example Request (withdrawals by addresses)**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      POST /api/1/blockchains/eth2/events/refetch HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {"async_query": false, "entry_type": "eth withdrawals", "addresses": ["0x4c66C2055f6A7A01e102Bde8d8d71d1D36667e21"], "from_timestamp": 1640995200, "to_timestamp": 1672531200}
+
+   **Example Request (all tracked validators)**:
+
+   .. http:example:: curl wget httpie python-requests
+
+      POST /api/1/blockchains/eth2/events/refetch HTTP/1.1
+      Host: localhost:5042
+      Content-Type: application/json;charset=UTF-8
+
+      {"async_query": false, "entry_type": "block productions"}
+
+   :reqjson bool async_query: If true, the query will be processed asynchronously.
+   :reqjson string entry_type: The type of staking events to refetch. Must be either ``block productions`` or ``eth withdrawals``.
+   :reqjson list[int] validator_indices: Optional. A list of one or more validator indices to refetch events for. Can't specify both ``validator_indices`` and ``addresses`` in the same query.
+   :reqjson list[string] addresses: Optional. A list of one or more withdrawal addresses to refetch events for. Can't specify both ``validator_indices`` and ``addresses`` in the same query.
+   :reqjson int from_timestamp: Optional. Start of the time period. Defaults to 0. Only meaningful for withdrawal events since beaconcha.in does not support time range filtering.
+   :reqjson int to_timestamp: Optional. End of the time period. Defaults to current time. Only meaningful for withdrawal events since beaconcha.in does not support time range filtering.
+
+   .. note::
+      If neither ``validator_indices`` nor ``addresses`` is provided, events are refetched for all tracked validators.
+
+   **Example Response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Content-Type: application/json
+
+      {
+          "result": {
+              "total": 3,
+              "per_validator": {
+                  12345: 2,
+                  67890: 1
+              },
+              "per_address": {
+                  "0x4c66C2055f6A7A01e102Bde8d8d71d1D36667e21": 2,
+                  "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01": 1
+              }
+          },
+          "message": ""
+      }
+
+   :resjson object result: An object containing the breakdown of newly added events during the refetch operation.
+   :resjson int result.total: The total number of newly added events.
+   :resjson object result.per_validator: A mapping of validator index to the number of newly added events for that validator. Only validators with new events are included.
+   :resjson object result.per_address: A mapping of reward/withdrawal address to the number of newly added events for that address. For block productions this is the fee recipient address, for withdrawals this is the withdrawal address. Only addresses with new events are included.
+
+   :statuscode 200: Refetch operation completed successfully.
+   :statuscode 400: Invalid parameters such as providing both validator_indices and addresses, validator indices not tracked by rotki, or no tracked validators found.
+   :statuscode 401: No user is currently logged in.
+   :statuscode 409: eth2 module is not active.
+   :statuscode 502: Could not reach external data sources (beaconcha.in or etherscan).
    :statuscode 500: Internal rotki error.
 
 

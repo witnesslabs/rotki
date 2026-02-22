@@ -55,10 +55,12 @@ from rotkehlchen.constants.assets import A_BCH, A_BTC, A_ETH, A_ETH2
 from rotkehlchen.constants.misc import ONE, VALID_LOGLEVELS, ZERO
 from rotkehlchen.constants.resolver import EVM_CHAIN_DIRECTIVE
 from rotkehlchen.data_import.manager import DataImportSource
+from rotkehlchen.db.cache import IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX
 from rotkehlchen.db.calendar import CalendarEntry, CalendarFilterQuery, ReminderEntry
 from rotkehlchen.db.constants import (
     LINKABLE_ACCOUNTING_PROPERTIES,
     LINKABLE_ACCOUNTING_SETTINGS_NAME,
+    HistoryMappingState,
 )
 from rotkehlchen.db.eth2 import DBEth2
 from rotkehlchen.db.filtering import (
@@ -617,8 +619,10 @@ class HistoryEventFilterSchema(
         SerializableEnumField(enum_class=HistoryBaseEntryType),
         load_default=None,
     )
-    customized_events_only = fields.Boolean(load_default=False)
-    virtual_events_only = fields.Boolean(load_default=False)
+    state_markers = DelimitedOrNormalList(
+        SerializableEnumField(enum_class=HistoryMappingState),
+        load_default=None,
+    )
     identifiers = DelimitedOrNormalList(fields.Integer(
         validate=webargs.validate.Range(
                 min=0,
@@ -637,18 +641,6 @@ class HistoryEventFilterSchema(
 
     # EthStakingEvent only
     validator_indices = DelimitedOrNormalList(fields.Integer(), load_default=None)
-
-    @validates_schema
-    def validate_history_event_schema(
-            self,
-            data: dict[str, Any],
-            **_kwargs: Any,
-    ) -> None:
-        if data['customized_events_only'] is True and data['virtual_events_only'] is True:
-            raise ValidationError(
-                message='Cannot filter by both customized and virtual events',
-                field_name='virtual_events_only',
-            )
 
     @post_load
     def make_history_event_filter(
@@ -702,8 +694,7 @@ class HistoryEventFilterSchema(
             'event_types': data['event_types'],
             'event_subtypes': data['event_subtypes'],
             'location': data['location'],
-            'customized_events_only': data['customized_events_only'],
-            'virtual_events_only': data['virtual_events_only'],
+            'state_markers': data['state_markers'],
             'identifiers': data['identifiers'],
             'notes_substring': data['notes_substring'],
         }
@@ -811,6 +802,14 @@ class HistoryEventFilterSchema(
         return {}
 
 
+class EventGroupPositionSchema(HistoryEventFilterSchema):
+    """Schema for finding the position of a group in the filtered event list."""
+    group_identifier = fields.String(required=True)
+
+    def generate_fields_post_validation(self, data: dict[str, Any]) -> dict[str, Any]:
+        return {'group_identifier': data['group_identifier']}
+
+
 class HistoryEventSchema(
     HistoryEventFilterSchema,
     DBPaginationSchema,
@@ -825,7 +824,6 @@ class HistoryEventSchema(
             data: dict[str, Any],
             **_kwargs: Any,
     ) -> None:
-        super().validate_history_event_schema(data, **_kwargs)
         valid_ordering_attr = {None, 'timestamp'}
         if (
             data['order_by_attributes'] is not None and
@@ -1094,9 +1092,9 @@ class CreateHistoryEventSchema(Schema):
             return {'events': [EthWithdrawalEvent(**data)]}
 
     class CreateAssetMovementEventSchema(BaseSchema):
-        event_type = SerializableEnumField(
-            enum_class=HistoryEventType,
-            allow_only=[HistoryEventType.DEPOSIT, HistoryEventType.WITHDRAWAL],
+        event_subtype = SerializableEnumField(
+            enum_class=HistoryEventSubType,
+            allow_only=[HistoryEventSubType.RECEIVE, HistoryEventSubType.SPEND],
             required=True,
         )
         fee = AmountField(load_default=None, validate=validate.Range(min=ZERO, min_inclusive=False))  # noqa: E501
@@ -1134,7 +1132,6 @@ class CreateHistoryEventSchema(Schema):
                     message='fee_notes may only be provided when fee_amount is present',
                     field_name='fee_notes',
                 )
-
             extra_data: AssetMovementExtraData = {}
             if (address := data['address']) is not None:
                 extra_data['address'] = address
@@ -1154,7 +1151,7 @@ class CreateHistoryEventSchema(Schema):
                 location=data['location'],
                 unique_id=unique_id,
                 timestamp=data['timestamp'],
-                event_type=data['event_type'],
+                event_subtype=data['event_subtype'],
                 identifier=data.get('identifier'),
                 group_identifier=data['group_identifier'],
                 amount=data['amount'],
@@ -1168,14 +1165,13 @@ class CreateHistoryEventSchema(Schema):
                 movement_notes=movement_notes,
                 fee_notes=fee_notes,
             ) if fee is not None else [AssetMovement(
-                is_fee=False,
                 asset=data['asset'],
                 amount=data['amount'],
                 location=data['location'],
                 unique_id=unique_id,
                 timestamp=data['timestamp'],
                 identifier=data.get('identifier'),
-                event_type=data['event_type'],
+                event_subtype=data['event_subtype'],
                 extra_data=extra_data,
                 group_identifier=data['group_identifier'],
                 location_label=data['location_label'],
@@ -2178,6 +2174,13 @@ class AccountingReportDataSchema(TimestampRangeSchema, DBPaginationSchema, DBOrd
         }
 
 
+class AccountingReportExportSchema(AccountingReportsSchema):
+    directory_path = DirectoryField(required=True)
+
+    def __init__(self) -> None:
+        super().__init__(required_report_id=True)
+
+
 class HistoryExportingSchema(Schema):
     directory_path = DirectoryField(required=True)
 
@@ -2558,7 +2561,7 @@ class BlockchainAccountsPutSchema(BlockchainAccountsPatchSchema):
 
 
 class StringAccountSchema(Schema):
-    accounts = fields.List(NonEmptyStringField(), required=True)
+    accounts = NonEmptyList(NonEmptyStringField(), required=True)
 
 
 class BlockchainTypeAccountsDeleteSchema(ChainTypeSchema, StringAccountSchema):
@@ -3437,7 +3440,7 @@ class AssetsImportingFromFormSchema(AsyncQueryArgumentSchema):
 
 
 class ReverseEnsSchema(AsyncIgnoreCacheQueryArgumentSchema):
-    ethereum_addresses = fields.List(EvmAddressField(), required=True)
+    ethereum_addresses = NonEmptyList(EvmAddressField(), required=True)
 
 
 class ResolveEnsSchema(AsyncIgnoreCacheQueryArgumentSchema):
@@ -3527,9 +3530,8 @@ class BaseAddressbookSchema(Schema):
 
 class AddressbookAddressesSchema(
     BaseAddressbookSchema,
-    OptionalAddressesWithBlockchainsListSchema,
 ):
-    ...
+    addresses = NonEmptyList(fields.Nested(AddressWithOptionalBlockchainSchema), required=True)
 
 
 class QueryAddressbookSchema(
@@ -4706,6 +4708,76 @@ class Eth2StakingEventsResetSchema(Schema):
     )
 
 
+class RefetchStakingEventsSchema(AsyncQueryArgumentSchema, TimestampRangeSchema):
+    entry_type = SerializableEnumField(
+        enum_class=HistoryEventQueryType,
+        allow_only=(HistoryEventQueryType.BLOCK_PRODUCTIONS, HistoryEventQueryType.ETH_WITHDRAWALS),  # noqa: E501
+        required=True,
+    )
+    validator_indices = fields.List(
+        fields.Integer(strict=True, validate=webargs.validate.Range(min=0)),
+        load_default=None,
+    )
+    addresses = fields.List(EvmAddressField(), load_default=None)
+
+    def __init__(self, database: 'DBHandler', **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.db = database
+
+    @validates_schema
+    def validate_refetch_schema(
+            self,
+            data: dict[str, Any],
+            **_kwargs: Any,
+    ) -> None:
+        validator_indices, addresses = data['validator_indices'], data['addresses']
+        if validator_indices and addresses:
+            raise ValidationError(
+                message="Can't specify both validator_indices and addresses in the same query",
+                field_name='validator_indices',
+            )
+
+        with self.db.conn.read_ctx() as cursor:
+            query, bindings = 'SELECT validator_index, withdrawal_address FROM eth2_validators', ()
+            if addresses:
+                query = f'SELECT DISTINCT validator_index, withdrawal_address FROM eth2_validators WHERE withdrawal_address IN ({",".join("?" * len(addresses))})'  # noqa: E501
+                bindings = addresses
+            elif validator_indices:
+                query += f' WHERE validator_index IN ({",".join("?" * len(validator_indices))})'
+                bindings = validator_indices
+
+            found_indices, found_addresses = list[int](), set[ChecksumEvmAddress]()
+            for row in cursor.execute(query, bindings):
+                found_indices.append(row[0])
+                if row[1] is not None:
+                    found_addresses.add(row[1])
+
+            if addresses and len(found_addresses) != len(addresses):
+                raise ValidationError(
+                    message='Some addresses have no associated validators tracked by rotki',
+                    field_name='addresses',
+                )
+            elif validator_indices and len(found_indices) != len(validator_indices):
+                raise ValidationError(
+                    message='Some validator indices are not tracked by rotki',
+                    field_name='validator_indices',
+                )
+            elif len(found_indices) == 0:  # neither provided and no tracked validators
+                raise ValidationError(
+                    message='No tracked validators found in rotki',
+                    field_name='validator_indices',
+                )
+
+            data['validator_indices'] = found_indices
+            data['addresses'] = list(found_addresses)
+
+        data['entry_type'] = (
+            HistoryBaseEntryType.ETH_BLOCK_EVENT
+            if data['entry_type'] == HistoryEventQueryType.BLOCK_PRODUCTIONS
+            else HistoryBaseEntryType.ETH_WITHDRAWAL_EVENT
+        )
+
+
 class SolanaTokenMigrationSchema(AsyncQueryArgumentSchema):
     old_asset = AssetField(required=True, expected_type=CryptoAsset, form_with_incomplete_data=True)  # noqa: E501
     address = SolanaAddressField(required=True)
@@ -4746,7 +4818,7 @@ class GetUnmatchedAssetMovementsSchema(Schema):
 
 class MatchAssetMovementsSchema(Schema):
     asset_movement = fields.Integer(required=True)
-    matched_event = fields.Integer(required=False, load_default=None)
+    matched_events = fields.List(fields.Integer(required=True), required=False, load_default=list)
 
 
 class FindPossibleMatchesSchema(Schema):
@@ -4756,13 +4828,54 @@ class FindPossibleMatchesSchema(Schema):
     tolerance = AmountField(required=True, validate=validate.Range(min=ZERO, min_inclusive=False))
 
 
-class UnlinkMatchedAssetMovementSchema(Schema):
-    asset_movement = fields.Integer(required=True)
-
-
 class TriggerTaskSchema(AsyncQueryArgumentSchema):
     task = SerializableEnumField(enum_class=TaskName, required=True)
 
 
+class SchedulerSchema(Schema):
+    enabled = fields.Boolean(required=True)
+
+
 class CustomizedEventDuplicatesFixSchema(AsyncQueryArgumentSchema):
     group_identifiers = fields.List(NonEmptyStringField(), load_default=None)
+
+
+class CustomizedEventDuplicatesIgnoreSchema(AsyncQueryArgumentSchema):
+    group_identifiers = fields.List(
+        cls_or_instance=NonEmptyStringField(),
+        required=True,
+        validate=validate.Length(min=1),
+    )
+
+    def __init__(self, db: 'DBHandler', action: Literal['ignore', 'unignore']) -> None:
+        super().__init__()
+        self.db = db
+        self.action = action
+
+    @validates_schema
+    def validate_schema(
+            self,
+            data: dict[str, Any],
+            **_kwargs: Any,
+    ) -> None:
+        prefix_len = len(IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX)
+        with self.db.conn.read_ctx() as cursor:
+            ignored = {
+                row[0][prefix_len:]
+                for row in cursor.execute(
+                    'SELECT name FROM key_value_cache WHERE name LIKE ?',
+                    (f'{IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX}%',),
+                )
+            }
+
+        given = set(data['group_identifiers'])
+        if self.action == 'ignore' and (already := given & ignored):
+            raise ValidationError(
+                message=f'Group identifiers {", ".join(sorted(already))} are already ignored',
+                field_name='group_identifiers',
+            )
+        if self.action == 'unignore' and (not_ignored := given - ignored):
+            raise ValidationError(
+                message=f'Group identifiers {", ".join(sorted(not_ignored))} are not ignored',
+                field_name='group_identifiers',
+            )

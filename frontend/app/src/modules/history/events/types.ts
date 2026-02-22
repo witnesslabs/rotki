@@ -18,10 +18,11 @@ interface HistoryEventDeletionPayload {
 export type HistoryEventDeletePayload = HistoryEventIgnorePayload | HistoryEventDeletionPayload;
 
 export interface HistoryEventUnlinkPayload {
-  readonly groupIdentifier: string;
+  readonly identifier: number;
 }
 
 export interface HistoryEventsTableEmits {
+  'clear-filters': [];
   'show:dialog': [options: DialogShowOptions];
   'set-page': [page: number];
   'refresh': [payload?: PullLocationTransactionPayload];

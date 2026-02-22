@@ -199,7 +199,7 @@ class EvmTransactions(ABC):  # noqa: B024
         May raise:
         - RemoteError if etherscan is used and there is a problem with reaching it or
         with parsing the response.
-        - pysqlcipher3.dbapi2.OperationalError if the SQL query fails due to
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to
         invalid filtering arguments.
         """
         for address in addresses:
@@ -259,6 +259,7 @@ class EvmTransactions(ABC):  # noqa: B024
         """
         period_as_blocks = self.evm_inquirer.maybe_timestamp_to_block_range(period)
         queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        queried_from_ts = Timestamp(period.from_value)
         for new_transactions in self.evm_inquirer.get_transactions(
                 account=address,
                 action='txlist',
@@ -289,12 +290,15 @@ class EvmTransactions(ABC):  # noqa: B024
 
                 if period.range_type == 'timestamps':
                     assert location_string, 'should always be given for timestamps'
+                    queried_to_ts = Timestamp(max(queried_from_ts, new_transactions[-1].timestamp))
+                    log.debug(f'{self.evm_inquirer.chain_name} transactions for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
                     if update_ranges:  # update last queried time for the address
                         self.dbranges.update_used_query_range(
                             write_cursor=write_cursor,
                             location_string=location_string,
-                            queried_ranges=[(period.from_value, new_transactions[-1].timestamp)],  # type: ignore
+                            queried_ranges=[(queried_from_ts, queried_to_ts)],
                         )
+                    queried_from_ts = queried_to_ts
 
             self.msg_aggregator.add_message(
                 message_type=WSMessageType.TRANSACTION_STATUS,
@@ -413,13 +417,18 @@ class EvmTransactions(ABC):  # noqa: B024
         """
         query_period_or_hash: TimestampOrBlockRange | EVMTxHash
         if isinstance(period_or_hash, TimestampOrBlockRange):
+            is_parent_hash_query = False
             query_period_or_hash = self.evm_inquirer.maybe_timestamp_to_block_range(
                 period=period_or_hash,
             )
+            queried_from_ts = Timestamp(period_or_hash.from_value) if period_or_hash.range_type == 'timestamps' else None  # noqa: E501
         else:
+            is_parent_hash_query = True
             query_period_or_hash = period_or_hash
+            queried_from_ts = None
 
         parent_tx_timestamps: dict[EVMTxHash, Timestamp] = {}
+        parent_hash_internal_txs: list[EvmInternalTransaction] = []
         queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
         for new_internal_txs in self.evm_inquirer.get_transactions(
                 account=address,
@@ -465,22 +474,27 @@ class EvmTransactions(ABC):  # noqa: B024
                 else:
                     timestamp = parent_tx_timestamps[internal_tx.parent_tx_hash]
 
-                with self.database.conn.write_ctx() as write_cursor:
-                    self.dbevmtx.add_evm_internal_transactions(
-                        write_cursor=write_cursor,
-                        transactions=[internal_tx],
-                        relevant_address=None,  # no need to re-associate address
-                    )
+                if is_parent_hash_query:
+                    parent_hash_internal_txs.append(internal_tx)
+                else:
+                    with self.database.conn.write_ctx() as write_cursor:
+                        self.dbevmtx.add_evm_internal_transactions(
+                            write_cursor=write_cursor,
+                            transactions=[internal_tx],
+                            relevant_address=None,  # no need to re-associate address
+                        )
 
-                if isinstance(period_or_hash, TimestampOrBlockRange) and period_or_hash.range_type == 'timestamps':  # noqa: E501
+                if queried_from_ts is not None:
                     assert location_string, 'should always be given for timestamps'
-                    log.debug(f'Internal {self.evm_inquirer.chain_name} transactions for {address} -> update range {period_or_hash.from_value} - {timestamp}')  # noqa: E501
+                    assert isinstance(period_or_hash, TimestampOrBlockRange), 'timestamp ranges only'  # noqa: E501
+                    queried_to_ts = Timestamp(max(queried_from_ts, timestamp))
+                    log.debug(f'Internal {self.evm_inquirer.chain_name} transactions for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
                     if update_ranges:  # update last queried time for address
                         with self.database.conn.write_ctx() as write_cursor:
                             self.dbranges.update_used_query_range(
                                 write_cursor=write_cursor,
                                 location_string=location_string,
-                                queried_ranges=[(period_or_hash.from_value, timestamp)],  # type: ignore
+                                queried_ranges=[(queried_from_ts, queried_to_ts)],
                             )
 
                     self.msg_aggregator.add_message(
@@ -492,6 +506,23 @@ class EvmTransactions(ABC):  # noqa: B024
                             'period': [period_or_hash.from_value, timestamp],
                             'status': str(TransactionStatusStep.QUERYING_INTERNAL_TRANSACTIONS),
                         },
+                    )
+                    queried_from_ts = queried_to_ts
+
+        if is_parent_hash_query:
+            assert not isinstance(query_period_or_hash, TimestampOrBlockRange)
+            parent_tx_hash = query_period_or_hash
+            with self.database.user_write() as write_cursor:
+                self.dbevmtx.delete_evm_internal_transactions_by_parent_tx_hash(
+                    write_cursor=write_cursor,
+                    parent_tx_hash=parent_tx_hash,
+                    chain_id=self.evm_inquirer.chain_id,
+                )
+                if len(parent_hash_internal_txs) != 0:
+                    self.dbevmtx.add_evm_internal_transactions(
+                        write_cursor=write_cursor,
+                        transactions=parent_hash_internal_txs,
+                        relevant_address=None,
                     )
         return queried_hashes
 
@@ -655,6 +686,7 @@ class EvmTransactions(ABC):  # noqa: B024
 
         log.debug(f'Querying erc20 transfers of {address} from {period.from_value} to {period.to_value} in {self.evm_inquirer.chain_name}')  # noqa: E501
         queried_hashes: list[EVMTxHash] | None = [] if return_queried_hashes else None
+        queried_from_ts = Timestamp(period.from_value)
         for erc20_tx_hashes in self.evm_inquirer.get_token_transaction_hashes(
             account=address,
             from_block=from_block,
@@ -680,13 +712,14 @@ class EvmTransactions(ABC):  # noqa: B024
                     existing_hashes.add(tx.tx_hash)
 
                 if period.range_type == 'timestamps':
-                    log.debug(f'{self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> update range {period.from_value} - {tx.timestamp}')  # noqa: E501
+                    queried_to_ts = Timestamp(max(queried_from_ts, tx.timestamp))
+                    log.debug(f'{self.evm_inquirer.chain_name} ERC20 Transfers for {address} -> update range {queried_from_ts} - {queried_to_ts}')  # noqa: E501
                     if update_ranges:  # update last queried time for the address
                         with self.database.user_write() as write_cursor:
                             self.dbranges.update_used_query_range(
                                 write_cursor=write_cursor,
                                 location_string=location_string,
-                                queried_ranges=[(Timestamp(period.from_value), tx.timestamp)],
+                                queried_ranges=[(queried_from_ts, queried_to_ts)],
                             )
 
                     self.msg_aggregator.add_message(
@@ -699,6 +732,7 @@ class EvmTransactions(ABC):  # noqa: B024
                             'status': str(TransactionStatusStep.QUERYING_EVM_TOKENS_TRANSACTIONS),
                         },
                     )
+                    queried_from_ts = queried_to_ts
         return queried_hashes
 
     def address_has_been_spammed(self, address: ChecksumEvmAddress) -> bool:
@@ -934,7 +968,7 @@ class EvmTransactions(ABC):  # noqa: B024
         evm transaction must have a corresponding receipt entry in the database.
 
         This function can raise:
-        - pysqlcipher3.dbapi2.OperationalError if the SQL query fails due to invalid
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to invalid
         filtering arguments.
         - RemoteError if there is a problem querying the data source.
         - DeserializationError if the transaction cannot be deserialized from the DB.
@@ -1177,7 +1211,7 @@ class EvmTransactions(ABC):  # noqa: B024
 
        May raise:
        - DeserializationError
-       - pysqlcipher3.dbapi2.OperationalError
+       - sqlcipher3.dbapi2.OperationalError
        - RemoteError if any of the remote queries fail.
        """
         period = TimestampOrBlockRange(

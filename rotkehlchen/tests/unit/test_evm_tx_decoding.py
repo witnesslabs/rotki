@@ -12,7 +12,7 @@ from rotkehlchen.chain.evm.l2_with_l1_fees.types import L2WithL1FeesTransaction
 from rotkehlchen.chain.evm.types import EvmAccount, string_to_evm_address
 from rotkehlchen.constants import ZERO
 from rotkehlchen.constants.assets import A_ETH, A_SAI
-from rotkehlchen.db.constants import TX_DECODED, TX_SPAM
+from rotkehlchen.db.constants import TX_DECODED, TX_SPAM, HistoryMappingState
 from rotkehlchen.db.evmtx import DBEvmTx
 from rotkehlchen.db.filtering import (
     EvmEventFilterQuery,
@@ -186,7 +186,11 @@ def test_tx_decode(ethereum_transaction_decoder, database):
     dbevents = DBHistoryEvents(database)
     # customize one evm event to check that the logic for them works correctly
     with database.user_write() as write_cursor:
-        assert dbevents.edit_history_event(write_cursor=write_cursor, event=events[1]) is None
+        assert dbevents.edit_history_event(
+            write_cursor=write_cursor,
+            event=events[1],
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        ) is None
 
     with database.user_write() as write_cursor:
         assert write_cursor.execute('SELECT COUNT(*) from history_events').fetchone()[0] == 2
@@ -194,10 +198,11 @@ def test_tx_decode(ethereum_transaction_decoder, database):
         assert write_cursor.execute('SELECT COUNT(*) from evm_tx_mappings').fetchone()[0] == 1
 
         dbevents.reset_events_for_redecode(write_cursor, Location.ETHEREUM)
-        # after deletion we only keep the customized event
-        assert write_cursor.execute('SELECT group_identifier from history_events').fetchall() == [(events[1].group_identifier,)]  # noqa: E501
-        assert write_cursor.execute('SELECT identifier from chain_events_info').fetchall() == [(events[1].identifier,)]  # noqa: E501
-        assert write_cursor.execute('SELECT COUNT(*) from evm_tx_mappings').fetchone()[0] == 0
+        # after deletion all events in the customized event's transaction are preserved
+        assert write_cursor.execute('SELECT COUNT(*) from history_events').fetchone()[0] == 2
+        assert write_cursor.execute('SELECT COUNT(*) from chain_events_info').fetchone()[0] == 2
+        # decoded status is preserved for transactions with customized events
+        assert write_cursor.execute('SELECT COUNT(*) from evm_tx_mappings').fetchone()[0] == 1
 
 
 @pytest.mark.vcr(filter_query_parameters=['apikey'])
@@ -501,7 +506,11 @@ def test_redecode_skips_customized_event_original_position(
     events[1].sequence_index = (new_seq_index := 200)
     events[1].notes = (edited_note := 'this note was edited')
     with database.user_write() as write_cursor:
-        dbevents.edit_history_event(write_cursor=write_cursor, event=events[1])
+        dbevents.edit_history_event(
+            write_cursor=write_cursor,
+            event=events[1],
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
 
     # 3. reset decoded status and redecode
     with database.user_write() as write_cursor:

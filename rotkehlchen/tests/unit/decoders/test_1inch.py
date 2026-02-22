@@ -751,6 +751,56 @@ def test_1inch_velodrome(optimism_inquirer, optimism_accounts):
     assert expected_events == events
 
 
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('optimism_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_1inch_wombatv2_swap(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0xb3f70f0eb6208572e30542304ba5513482b7ff095abd2beb2d22101a705770f2')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=tx_hash,
+    )
+    expected_events = [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1707525791000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal(gas := '0.000210503989653813'),
+            location_label=(user_addy := optimism_accounts[0]),
+            notes=f'Burn {gas} ETH for gas',
+            counterparty=CPT_GAS,
+        ), EvmSwapEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_subtype=HistoryEventSubType.SPEND,
+            asset=Asset('eip155:10/erc20:0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85'),
+            amount=FVal(spend_amount := '400.643728'),
+            location_label=user_addy,
+            notes=f'Swap {spend_amount} USDC in 1inch-v5',
+            address=ONEINCH_V5_ROUTER,
+            counterparty=CPT_ONEINCH_V5,
+        ), EvmSwapEvent(
+            tx_ref=tx_hash,
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_subtype=HistoryEventSubType.RECEIVE,
+            asset=Asset('eip155:10/erc20:0x7F5c764cBc14f9669B88837ca1490cCa17c31607'),
+            amount=FVal(receive_amount := '400.604528'),
+            location_label=user_addy,
+            notes=f'Receive {receive_amount} USDC.e as a result of a 1inch-v5 swap',
+            counterparty=CPT_ONEINCH_V5,
+            address=ONEINCH_V5_ROUTER,
+        ),
+    ]
+    assert expected_events == events
+
+
 @pytest.mark.vcr
 @pytest.mark.parametrize('ethereum_accounts', [['0xC5d494aa0CBabD7871af0Ef122fB410Fa25c3379']])
 def test_half_decoded_1inch_v5_swap(ethereum_inquirer, ethereum_accounts):
@@ -1146,4 +1196,51 @@ def test_limit_order_swap(
         notes=f'Receive {receive_amount} EURe as the result of a 1inch limit order',
         counterparty=CPT_ONEINCH_V6,
         address=string_to_evm_address('0x3Ea8d8E835fA597D9AB64E10f4fA33EC9Bc261f9'),
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xbcb36149cC4C4d142842957Ad316E40EEA0BCDd2']])
+def test_limit_order_swap_via_uniswap(ethereum_inquirer, ethereum_accounts):
+    """Test that a 1inch limit order executed via Uniswap is correctly decoded when the uniswap
+    decoder already partially decodes the swap.
+    """
+    tx_hash = deserialize_evm_tx_hash('0xfb5fed9f9e3991cdd1b56fe64a76e4c27e780a4bd8fe7c9897bced23d98d087d')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=1,
+        timestamp=(timestamp := TimestampMS(1752224819000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.INFORMATIONAL,
+        event_subtype=HistoryEventSubType.APPROVE,
+        asset=(a_ai2027 := Asset('eip155:1/erc20:0xC0138Db8a5eB4EB9885bc7a30501C8C79ea0ffbf')),
+        amount=FVal(approve_amount := '115792089237316195423570985008687907853269984665640564039457580394609.129639935'),  # noqa: E501
+        location_label=(user_address := ethereum_accounts[0]),
+        notes=f'Set AI2027 spending approval of {user_address} by 0x111111125421cA6dc452d289314280a0f8842A65 to {approve_amount}',  # noqa: E501
+        address=string_to_evm_address('0x111111125421cA6dc452d289314280a0f8842A65'),
+    ), EvmSwapEvent(
+        tx_ref=tx_hash,
+        sequence_index=2,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_subtype=HistoryEventSubType.SPEND,
+        asset=a_ai2027,
+        amount=FVal('2000000'),
+        location_label=user_address,
+        notes='Swap 2000000 AI2027 in a 1inch limit order',
+        counterparty=CPT_ONEINCH_V6,
+        address=string_to_evm_address('0xfC2c6B1952B55F1380c4b502a79748Ec009872EB'),
+    ), EvmSwapEvent(
+        tx_ref=tx_hash,
+        sequence_index=3,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_subtype=HistoryEventSubType.RECEIVE,
+        asset=A_ETH,
+        amount=FVal('0.131625268022102434'),
+        location_label=user_address,
+        notes='Receive 0.131625268022102434 ETH as the result of a 1inch limit order',
+        counterparty=CPT_ONEINCH_V6,
+        address=string_to_evm_address('0xfC2c6B1952B55F1380c4b502a79748Ec009872EB'),
     )]

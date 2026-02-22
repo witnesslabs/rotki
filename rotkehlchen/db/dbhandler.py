@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Unpack, cast, overload
 
 from gevent.lock import Semaphore
-from pysqlcipher3 import dbapi2 as sqlcipher
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.accounting.structures.balance import BalanceType
 from rotkehlchen.assets.asset import Asset, EvmToken
+from rotkehlchen.assets.resolver import AssetResolver
 from rotkehlchen.assets.types import AssetType
 from rotkehlchen.balances.manual import ManuallyTrackedBalance
 from rotkehlchen.chain.accounts import (
@@ -42,7 +43,6 @@ from rotkehlchen.db.cache import (
     DBCacheDynamic,
     DBCacheStatic,
     ExtraTxArgType,
-    IdentifierArgType,
     IndexArgType,
     LabeledLocationArgsType,
     LabeledLocationIdArgsType,
@@ -224,6 +224,7 @@ class DBHandler:
         # Lock to make sure that 2 callers of get_or_create_evm_token do not go in at the same time
         self.get_or_create_token_lock = Semaphore()
         self.match_asset_movements_lock = Semaphore()
+        self._ignored_asset_ids_cache: dict[bool, set[str]] = {}
         self.password = password
         self._connect()
         self._check_unfinished_upgrades(resume_from_backup=resume_from_backup)
@@ -862,15 +863,6 @@ class DBHandler:
     ) -> str | None:
         ...
 
-    @overload
-    def get_dynamic_cache(
-            self,
-            cursor: 'DBCursor',
-            name: Literal[DBCacheDynamic.MATCHED_ASSET_MOVEMENT],
-            **kwargs: Unpack[IdentifierArgType],
-    ) -> int | None:
-        ...
-
     def get_dynamic_cache(
             self,
             cursor: 'DBCursor',
@@ -1028,16 +1020,6 @@ class DBHandler:
     ) -> None:
         ...
 
-    @overload
-    def set_dynamic_cache(
-            self,
-            write_cursor: 'DBCursor',
-            name: Literal[DBCacheDynamic.MATCHED_ASSET_MOVEMENT],
-            value: int,
-            **kwargs: Unpack[IdentifierArgType],
-    ) -> None:
-        ...
-
     def set_dynamic_cache(
             self,
             write_cursor: 'DBCursor',
@@ -1049,6 +1031,40 @@ class DBHandler:
         write_cursor.execute(
             'INSERT OR REPLACE INTO key_value_cache(name, value) VALUES(?, ?)',
             (name.get_db_key(**kwargs), value),
+        )
+
+    def get_historical_balance_cache(
+            self,
+            cursor: 'DBCursor',
+            blockchain: SupportedBlockchain,
+            address: str,
+            asset: Asset,
+            block_number: int,
+    ) -> FVal | None:
+        if (result := cursor.execute(
+            'SELECT amount FROM historical_balance_cache '
+            'WHERE blockchain=? AND address=? AND asset=? AND block_number=?',
+            (blockchain.value, address, asset.identifier, block_number),
+        ).fetchone()) is None:
+            return None
+
+        return FVal(result[0])
+
+    def set_historical_balance_cache(
+            self,
+            write_cursor: 'DBCursor',
+            blockchain: SupportedBlockchain,
+            address: str,
+            asset: Asset,
+            amount: FVal,
+            timestamp: Timestamp,
+            block_number: int,
+    ) -> None:
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO historical_balance_cache('
+            'blockchain, address, asset, amount, timestamp, block_number'
+            ') VALUES (?, ?, ?, ?, ?, ?)',
+            (blockchain.value, address, asset.identifier, str(amount), timestamp, block_number),
         )
 
     def add_external_service_credentials(
@@ -1116,6 +1132,7 @@ class DBHandler:
             'UPDATE history_events SET ignored=? WHERE asset=?',
             (1, asset.identifier),
         )
+        self.invalidate_ignored_assets_cache()
 
     def ignore_multiple_assets(self, write_cursor: 'DBCursor', assets: list[str]) -> None:
         """Add the provided identifiers to the list of ignored assets. If any asset was already
@@ -1131,6 +1148,7 @@ class DBHandler:
                 f'UPDATE history_events SET ignored=1 WHERE asset IN ({placeholders})',
                 chunk,
             )
+        self.invalidate_ignored_assets_cache()
 
     def remove_from_ignored_assets(self, write_cursor: 'DBCursor', asset: Asset) -> None:
         """Remove an asset from the ignored assets and un-ignore history events with this asset."""
@@ -1142,6 +1160,10 @@ class DBHandler:
             'UPDATE history_events SET ignored=? WHERE asset=?',
             (0, asset.identifier),
         )
+        self.invalidate_ignored_assets_cache()
+
+    def invalidate_ignored_assets_cache(self) -> None:
+        self._ignored_asset_ids_cache.clear()
 
     def get_ignored_asset_ids(self, cursor: 'DBCursor', only_nfts: bool = False) -> set[str]:
         """Gets the ignored asset ids without converting each one of them to an asset object
@@ -1149,13 +1171,24 @@ class DBHandler:
         We used to have a heavier version which converted them to an asset but removed
         it due to unnecessary roundtrips to the global DB for each asset initialization
         """
+        if (cached := self._ignored_asset_ids_cache.get(only_nfts)) is not None:
+            return set(cached)
+        if (
+                only_nfts is True and
+                (all_cached := self._ignored_asset_ids_cache.get(False)) is not None
+        ):
+            nfts_only = {asset_id for asset_id in all_cached if asset_id.startswith(NFT_DIRECTIVE)}
+            self._ignored_asset_ids_cache[True] = nfts_only
+            return set(nfts_only)
         bindings = []
         query = "SELECT value FROM multisettings WHERE name='ignored_asset' "
         if only_nfts is True:
             query += 'AND value LIKE ?'
             bindings.append(f'{NFT_DIRECTIVE}%')
         cursor.execute(query, bindings)
-        return {x[0] for x in cursor}
+        result = {x[0] for x in cursor}
+        self._ignored_asset_ids_cache[only_nfts] = result
+        return set(result)
 
     def add_to_ignored_action_ids(
             self,
@@ -1293,7 +1326,11 @@ class DBHandler:
 
     def purge_exchange_data(self, write_cursor: 'DBCursor', location: Location) -> None:
         self.delete_used_query_range_for_exchange(write_cursor=write_cursor, location=location)
-        DBHistoryEvents(database=self).delete_events_and_track(
+        (events_db := DBHistoryEvents(database=self)).restore_matched_events_before_purge(
+            write_cursor=write_cursor,
+            location=location,
+        )
+        events_db.delete_events_and_track(
             write_cursor=write_cursor,
             where_clause='WHERE location = ?',
             where_bindings=(location.serialize_for_db(),),
@@ -2407,19 +2444,16 @@ class DBHandler:
             **kwargs: Any,
     ) -> int:
         """Returns how many of a certain type of entry are saved in the DB"""
-        cursorstr = f'SELECT COUNT(*) from {entries_table}'
+        if group_by is not None:
+            cursorstr = f'SELECT COUNT(DISTINCT {group_by}) from {entries_table}'
+        else:
+            cursorstr = f'SELECT COUNT(*) from {entries_table}'
         if len(kwargs) != 0:
             cursorstr += ' WHERE'
             cursorstr += op.join([f' {arg} = "{val}" ' for arg, val in kwargs.items()])
-        if group_by is not None:
-            cursorstr += f' GROUP BY {group_by}'
-
         cursorstr += ';'
         cursor.execute(cursorstr)
 
-        if group_by is not None:
-            return len(cursor.fetchall())
-        # else
         return cursor.fetchone()[0]
 
     def delete_data_for_evm_address(
@@ -2804,6 +2838,7 @@ class DBHandler:
         # but think on the performance. This is a synchronous api call so if
         # it starts taking too much time the calling logic needs to change
         results = set()
+        asset_ids_by_table: dict[str, set[str]] = {}
         for table_entry in TABLES_WITH_ASSETS:
             table_name = table_entry[0]
             columns = table_entry[1:]
@@ -2823,31 +2858,41 @@ class DBHandler:
                 log.error(f'Could not fetch assets from table {table_name}. {e!s}')
                 continue
 
+            table_asset_ids: set[str] = set()
             for result in cursor:
                 for asset_id in result:
-                    try:
-                        if asset_id is not None:
-                            results.add(Asset(asset_id).check_existence())
-                    except UnknownAsset:
-                        if table_name == 'manually_tracked_balances':
-                            self.msg_aggregator.add_warning(
-                                f'Unknown/unsupported asset {asset_id} found in the '
-                                f'manually tracked balances. Have you modified the assets DB? '
-                                f'Make sure that the aforementioned asset is in there.',
-                            )
-                        else:
-                            log.debug(
-                                f'Unknown/unsupported asset {asset_id} found in the database '
-                                f'If you believe this should be supported open an issue in github',
-                            )
-
+                    if asset_id is None:
                         continue
-                    except DeserializationError:
+                    if isinstance(asset_id, str) is False:
                         self.msg_aggregator.add_error(
                             f'Asset with non-string type {type(asset_id)} found in the '
                             f'database. Skipping it.',
                         )
                         continue
+                    table_asset_ids.add(asset_id)
+
+            if len(table_asset_ids) != 0:
+                asset_ids_by_table[table_name] = table_asset_ids
+
+        all_asset_ids = set().union(*asset_ids_by_table.values()) if asset_ids_by_table else set()
+        normalized_map, unknown_ids = AssetResolver.bulk_check_existence(all_asset_ids)
+        for table_name, table_asset_ids in asset_ids_by_table.items():
+            for asset_id in table_asset_ids:
+                if asset_id in unknown_ids:
+                    if table_name == 'manually_tracked_balances':
+                        self.msg_aggregator.add_warning(
+                            f'Unknown/unsupported asset {asset_id} found in the '
+                            f'manually tracked balances. Have you modified the assets DB? '
+                            f'Make sure that the aforementioned asset is in there.',
+                        )
+                    else:
+                        log.debug(
+                            f'Unknown/unsupported asset {asset_id} found in the database '
+                            f'If you believe this should be supported open an issue in github',
+                        )
+                    continue
+
+                results.add(Asset(normalized_map.get(asset_id, asset_id)))
 
         return list(results)
 

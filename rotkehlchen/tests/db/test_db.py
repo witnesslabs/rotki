@@ -166,13 +166,13 @@ TABLES_AT_INIT = [
     'key_value_cache',
     'lido_csm_node_operators',
     'lido_csm_node_operator_metrics',
-    'event_metrics',
     'zksynclite_tx_type',
     'zksynclite_transactions',
     'zksynclite_swaps',
     'calendar_reminders',
     'cowswap_orders',
     'gnosispay_data',
+    'historical_balance_cache',
     'solana_transactions',
     'solana_tx_account_keys',
     'solana_tx_instruction_accounts',
@@ -180,6 +180,10 @@ TABLES_AT_INIT = [
     'solanatx_address_mappings',
     'solana_tx_mappings',
     'solana_ata_address_mappings',
+    'history_event_links',
+    'history_event_link_ignores',
+    'history_events_backup',
+    'chain_events_info_backup',
 ]
 
 
@@ -663,7 +667,7 @@ def test_sqlcipher_detect_version():
         def set_progress_handler(self, a, b) -> None:
             pass
 
-    with patch('pysqlcipher3.dbapi2.connect') as sql_mock:
+    with patch('sqlcipher3.dbapi2.connect') as sql_mock:
         sql_mock.return_value = ConnectionMock('4.0.0 community')
         assert detect_sqlcipher_version() == 4
         sql_mock.return_value = ConnectionMock('4.0.1 something')

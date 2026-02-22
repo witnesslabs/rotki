@@ -111,6 +111,7 @@ const pricesLoading = computed(() => {
           class="flex-1 text-h5 font-medium text-rui-text-secondary"
           :value="info.usdPrice"
           :loading="pricesLoading"
+          :price-asset="identifier"
           from="USD"
         />
 

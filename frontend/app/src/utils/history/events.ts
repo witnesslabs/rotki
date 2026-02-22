@@ -1,5 +1,7 @@
 import type { ComputedRef, MaybeRef } from 'vue';
+import type { LocationAndTxRef } from '@/types/history/events';
 import { HistoryEventEntryType } from '@rotki/common';
+import { snakeCase } from 'es-toolkit';
 import {
   type AssetMovementEvent,
   type EthBlockEvent,
@@ -8,7 +10,9 @@ import {
   type EvmSwapEvent,
   type HistoryEvent,
   HistoryEventAccountingRuleStatus,
+  type HistoryEventCollectionRow,
   type HistoryEventEntry,
+  type HistoryEventEntryWithMeta,
   HistoryEventState,
   type OnlineHistoryEvent,
   type SolanaEvent,
@@ -122,4 +126,15 @@ export function hasEventState(event: HistoryEventEntry, state: HistoryEventState
 
 export function isCustomizedEvent(event: HistoryEventEntry): boolean {
   return hasEventState(event, HistoryEventState.CUSTOMIZED);
+}
+
+export function getEventEntryFromCollection(row: HistoryEventCollectionRow): HistoryEventEntryWithMeta {
+  return Array.isArray(row) ? row[0] : row;
+}
+
+export function toLocationAndTxRef(params: LocationAndTxRef): LocationAndTxRef {
+  return {
+    location: snakeCase(params.location),
+    txRef: params.txRef,
+  };
 }

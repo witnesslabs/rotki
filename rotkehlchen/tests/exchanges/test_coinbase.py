@@ -1,4 +1,5 @@
 import base64
+import re
 import uuid
 import warnings as test_warnings
 from typing import TYPE_CHECKING, Any
@@ -363,11 +364,20 @@ def test_coinbase_query_trade_history_paginated(function_scope_coinbase):
         '"next_uri": null',
         '"next_uri": "/v2/transactions/?next-page"',
     )
+    highest_id = max(int(x) for x in re.findall(r'"id": "id(\d+)"', TRANSACTIONS_RESPONSE))
+    for idx in range(1, highest_id + 1):
+        # Convert ids so they are unique when it uses the original TRANSACTIONS_RESPONSE when
+        # querying the next page
+        paginated_transactions_response = paginated_transactions_response.replace(
+            f'"id": "id{idx}"',
+            f'"id": "id{idx + highest_id}"',
+        )
+
     query_coinbase_and_test(
         coinbase=coinbase,
         expected_warnings_num=0,
         expected_errors_num=0,
-        expected_events_num=7,
+        expected_events_num=14,
         transactions_response=paginated_transactions_response,
     )
 
@@ -446,7 +456,7 @@ def test_coinbase_query_history_events(
         group_identifier='582c2b78e88052d879b203fd07b6fca15f90417da7f715dcda72275b8d290054',
         location=Location.COINBASE,
         location_label=coinbase.name,
-        event_type=HistoryEventType.DEPOSIT,
+        event_subtype=HistoryEventSubType.RECEIVE,
         timestamp=TimestampMS(1502554304000),
         asset=A_BTC,
         amount=FVal('0.10181673'),
@@ -464,7 +474,7 @@ def test_coinbase_query_history_events(
         location_label=coinbase.name,
         group_identifier=create_group_identifier_from_unique_id(
             location=Location.COINBASE,
-            unique_id='txid-1',
+            unique_id='id10',
         ),
     ), SwapEvent(
         identifier=9,
@@ -476,14 +486,14 @@ def test_coinbase_query_history_events(
         location_label=coinbase.name,
         group_identifier=create_group_identifier_from_unique_id(
             location=Location.COINBASE,
-            unique_id='txid-1',
+            unique_id='id10',
         ),
     ), AssetMovement(
         identifier=1,
         group_identifier='157b922cd6b7d3be91d0d3c2e197153dfb91dd9f8d2507eb83b9e3d477a5e6fd',
         location=Location.COINBASE,
         location_label=coinbase.name,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.SPEND,
         timestamp=TimestampMS(1566726126000),
         asset=A_ETH,
         amount=FVal('0.05749427'),
@@ -497,7 +507,7 @@ def test_coinbase_query_history_events(
         group_identifier='af84752f7e7bcdd99c91dd856a117086df6205e26f0c8f6e530dfd5f3ff5add1',
         location=Location.COINBASE,
         location_label=coinbase.name,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.SPEND,
         timestamp=TimestampMS(1566726126000),
         asset=A_ETH,
         amount=FVal('0.05770427'),
@@ -510,11 +520,10 @@ def test_coinbase_query_history_events(
         group_identifier='157b922cd6b7d3be91d0d3c2e197153dfb91dd9f8d2507eb83b9e3d477a5e6fd',
         location=Location.COINBASE,
         location_label=coinbase.name,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.FEE,
         timestamp=TimestampMS(1566726126000),
         asset=A_ETH,
         amount=FVal('0.00021'),
-        is_fee=True,
     ), SwapEvent(
         identifier=10,
         timestamp=TimestampMS(1569366095000),
@@ -525,7 +534,7 @@ def test_coinbase_query_history_events(
         location_label=coinbase.name,
         group_identifier=create_group_identifier_from_unique_id(
             location=Location.COINBASE,
-            unique_id='txid-2',
+            unique_id='id11',
         ),
     ), SwapEvent(
         identifier=11,
@@ -537,7 +546,7 @@ def test_coinbase_query_history_events(
         location_label=coinbase.name,
         group_identifier=create_group_identifier_from_unique_id(
             location=Location.COINBASE,
-            unique_id='txid-2',
+            unique_id='id11',
         ),
     ), HistoryEvent(
         identifier=5,
@@ -580,7 +589,7 @@ def test_coinbase_query_history_events(
         group_identifier='1181793af14ed42cb443d55ce50f68deef95b320c114025cb25a988f005a3a76',
         location=Location.COINBASE,
         location_label=coinbase.name,
-        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.SPEND,
         timestamp=TimestampMS(1615493615000),
         asset=A_BTC,
         amount=FVal('0.00100000'),
@@ -1766,3 +1775,133 @@ def test_ignore_updated_at_ts(function_scope_coinbase):
         coinbase.query_history_events()
 
     assert tx_query_mock.call_count == 1
+
+
+def test_ignore_same_asset_same_amount_swap(function_scope_coinbase):
+    """Test that swaps are ignored if the spend and receive are exactly the same asset and amount.
+    Regression test for https://github.com/rotki/rotki/issues/11483. Mocks the tx response with
+    both a valid USDC->USD swap and a USD->USD swap that should be ignored.
+    """
+    with patch.object(
+        target=function_scope_coinbase.session,
+        attribute='get',
+        side_effect=_create_coinbase_mock("""{ "data": [{
+            "amount": {"amount": "-200.000000", "currency": "USDC"},
+            "created_at": "2025-12-31T13:52:34Z",
+            "id": "TEST_ID_1",
+            "native_amount": {"amount": "-200.00", "currency": "USD"},
+            "resource": "transaction",
+            "resource_path": "/v2/accounts/REDACTED/transactions/TEST_ID_1",
+            "sell": {
+                "id": "TEST_ID_1",
+                "payment_method_name": "USDC Wallet",
+                "subtotal": {"amount": "200.00", "currency": "USD"},
+                "total": {"amount": "200.00", "currency": "USD"}
+            },
+            "status": "completed",
+            "type": "sell"
+        },{
+            "amount": {"amount": "200.00", "currency": "USD"},
+            "created_at": "2025-12-31T13:52:34Z",
+            "id": "TEST_ID_2",
+            "native_amount": {"amount": "200.00", "currency": "USD"},
+            "resource": "transaction",
+            "resource_path": "/v2/accounts/REDACTED/transactions/TEST_ID_2",
+            "sell": {
+                "id": "TEST_ID_2",
+                "payment_method_name": "USDC Wallet",
+                "subtotal": {"amount": "200.00", "currency": "USD"},
+                "total": {"amount": "200.00", "currency": "USD"}
+            },
+            "status": "completed",
+            "type": "sell"
+        }]}"""),
+    ):
+        function_scope_coinbase.query_history_events()
+
+    assert len(function_scope_coinbase.msg_aggregator.consume_warnings()) == 0
+    assert len(function_scope_coinbase.msg_aggregator.consume_errors()) == 0
+    with function_scope_coinbase.db.conn.read_ctx() as cursor:
+        assert DBHistoryEvents(function_scope_coinbase.db).get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(),
+        ) == [SwapEvent(
+            identifier=1,
+            timestamp=TimestampMS(1767189154000),
+            location=Location.COINBASE,
+            event_subtype=HistoryEventSubType.SPEND,
+            asset=A_USDC,
+            amount=FVal('200'),
+            location_label='coinbase',
+            group_identifier=create_group_identifier_from_unique_id(
+                location=Location.COINBASE,
+                unique_id='TEST_ID_1',
+            ),
+        ), SwapEvent(
+            identifier=2,
+            timestamp=TimestampMS(1767189154000),
+            location=Location.COINBASE,
+            event_subtype=HistoryEventSubType.RECEIVE,
+            asset=A_USD,
+            amount=FVal('200'),
+            location_label='coinbase',
+            group_identifier=create_group_identifier_from_unique_id(
+                location=Location.COINBASE,
+                unique_id='TEST_ID_1',
+            ),
+        )]
+
+
+def test_ignore_same_asset_and_amount_conversion(mock_coinbase):
+    """Test that a conversion where the spend/receive asset and amount are the same is ignored."""
+    assert mock_coinbase._process_trades_from_conversion(
+        transaction_pairs={(tx_id := '77c5ad72-764e-414b-8bdb-b5aed20fb4b1'): [{
+            'id': tx_id,
+            'type': 'trade',
+            'status': 'completed',
+            'amount': {
+                'amount': '500',
+                'currency': 'EUR',
+            },
+            'native_amount': {
+                'amount': '500',
+                'currency': 'EUR',
+            },
+            'created_at': '2020-06-08T02:32:15Z',
+            'updated_at': '2021-06-08T02:32:16Z',
+            'resource': 'transaction',
+            'resource_path': f'/v2/accounts/sd5af/transactions/{tx_id}',
+            'trade': {
+                'fee': {
+                    'amount': '1',
+                    'currency': 'XTZ',
+                },
+                'id': '5dceef97-ef34-41e6-9171-3e60cd01639e',
+                'payment_method_name': 'ETH Wallet',
+            },
+        }]},
+    ) == []
+
+
+def test_ignore_asset_and_amount_advancedtrade(mock_coinbase):
+    """Test that if an advanced trade fill where the spend/receive asset and amount are the same
+    is ignored.
+    """
+    assert mock_coinbase._process_coinbase_trade({
+        'id': 'id1',
+        'type': 'advanced_trade_fill',
+        'status': 'completed',
+        'amount': {'amount': '-500', 'currency': 'USDC'},
+        'native_amount': {'amount': '-500', 'currency': 'EUR'},
+        'created_at': '2024-03-07T08:12:51Z',
+        'updated_at': '2024-03-07T08:12:51Z',
+        'resource': 'transaction',
+        'resource_path': '/v2/accounts/REDACTED/transactions/id1',
+        'advanced_trade_fill': {
+            'fill_price': '1',
+            'product_id': 'EUR-EUR',
+            'order_id': 'orderid1',
+            'commission': '0',
+            'order_side': 'sell',
+        },
+    }) == []

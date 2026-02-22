@@ -453,6 +453,9 @@
       "error": {
         "description": "Échec de la requête des comptes pour {blockchain} : {message}",
         "title": "Interrogation des comptes"
+      },
+      "task": {
+        "title": "Interrogation des comptes {blockchain}"
       }
     },
     "history": {
@@ -1644,7 +1647,6 @@
     "title": "Gérer les données"
   },
   "data_table": {
-    "items_no": "Éléments #",
     "no_data": "Aucune donnée disponible",
     "rows_per_page": "Lignes par page"
   },
@@ -3218,25 +3220,25 @@
     "progress": "{progress} %"
   },
   "purge_selector": {
+    "centralized_exchange": "Échange centralisé",
     "centralized_exchange_to_clear": {
       "hint": "Laissez ce champ vide pour supprimer les données de tous les échanges centralisés",
       "label": "Échange centralisé à effacer"
     },
-    "centralized_exchanges": "Échanges centralisés",
     "chain_to_clear": {
       "hint": "Laissez ce champ vide pour supprimer les données de toutes les chaînes",
       "label": "Chaîne à effacer"
     },
+    "decentralized_exchange": "Échange décentralisé",
     "decentralized_exchange_to_clear": {
       "hint": "Laissez ce champ vide pour supprimer les données de tous les échanges décentralisés",
       "label": "Échange décentralisé à effacer"
     },
-    "decentralized_exchanges": "Échanges décentralisés",
+    "defi_module": "Module DeFi",
     "defi_module_to_clear": {
       "hint": "Laissez ce champ vide pour supprimer les données de tous les modules DeFi",
       "label": "Module DeFi à effacer"
     },
-    "defi_modules": "Modules DeFi",
     "label": "Sélectionner une source de données",
     "transactions": "Transactions"
   },
@@ -3632,8 +3634,6 @@
         "evm_event": "Transaction {txRef}",
         "history_event": "Événement {location}"
       },
-      "loading": "Chargement des événements...",
-      "no_data": "Les événements sont masqués car ils contiennent des actifs ignorés",
       "skipped": {
         "csv_export_error": "Il y a eu une erreur avec l'exportation",
         "download_failed": "Le téléchargement du CSV n'est pas possible",
@@ -3653,10 +3653,6 @@
             "title": "Événements ignorés traités"
           }
         }
-      },
-      "view": {
-        "hide": "Masquer les événements",
-        "show": "Afficher les événements ({length})"
       }
     },
     "events_decoding": {
@@ -3683,7 +3679,6 @@
       "account": "Filtrer par compte",
       "address": "filtrer par adresse de contrepartie",
       "asset": "filtrer par l'actif des événements",
-      "customized_only": "Afficher uniquement les événements personnalisés",
       "date_hint": "format {format} HH:mm:ss (les secondes sont optionnelles)",
       "end_date": "filtrer par la date de fin de la période des transactions",
       "entry_type": "filtrer par type d'entrée",

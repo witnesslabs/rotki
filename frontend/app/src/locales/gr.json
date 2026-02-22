@@ -349,6 +349,9 @@
       "error": {
         "description": "Failed to query accounts for {blockchain}: {message}",
         "title": "Querying of accounts"
+      },
+      "task": {
+        "title": "Querying {blockchain} accounts"
       }
     },
     "history": {
@@ -1451,7 +1454,6 @@
     "title": "Manage Data"
   },
   "data_table": {
-    "items_no": "Αντικείμενα #",
     "no_data": "Δεν υπάρχουν διαθέσιμα στοιχεία",
     "rows_per_page": "Γραμμές ανα σελίδα"
   },
@@ -2823,25 +2825,25 @@
     "progress": "{progress} %"
   },
   "purge_selector": {
+    "centralized_exchange": "Κεντρικοποιημένο ανταλλακτήριο",
     "centralized_exchange_to_clear": {
       "hint": "Αδειάστε αυτό το πεδίο για να αφαιρέσετε τα δεδομένα για όλα τα κεντρικοποιημένα ανταλλακτήρια.",
       "label": "Κεντρικοποιημένα ανταλλακτήρια για εκκαθάριση"
     },
-    "centralized_exchanges": "Κεντρικοποιημένα ανταλλακτήρια",
     "chain_to_clear": {
       "hint": "Αδειάστε αυτό το πεδίο για να αφαιρέσετε τα δεδομένα συναλλαγής για όλες τις αλυσίδες",
       "label": "chain για εκκαθάριση"
     },
+    "decentralized_exchange": "Αποκεντρωμένο ανταλλακτήριο",
     "decentralized_exchange_to_clear": {
       "hint": "Αδειάστε αυτό το πεδίο για να καταργήσετε τα δεδομένα για όλα τα αποκεντρωμένα ανταλλακτήρια",
       "label": "Αποκεντρωμένα ανταλλακτήρια για εκκαθάριση"
     },
-    "decentralized_exchanges": "Αποκεντρωμένα ανταλλακτήρια",
+    "defi_module": "Μονάδα Defi",
     "defi_module_to_clear": {
       "hint": "Αδειάστε αυτό το πεδίο για να αφαιρέσετε τα δεδομένα για όλες τις μονάδες defi",
       "label": "Μονάδα DeFi για εκκαθάριση"
     },
-    "defi_modules": "DeFi Modules",
     "label": "Επιλέξτε μια πηγή δεδομένων",
     "transactions": "Συναλλαγές"
   },
@@ -3147,8 +3149,6 @@
       "headers": {
         "event_identifier": "Event information"
       },
-      "loading": "Φόρτωση συμβάντων...",
-      "no_data": "Τα συμβάντα είναι κρυμμένα επειδή περιέχουν αγνοημένα στοιχεία ενεργητικού",
       "skipped": {
         "csv_export_error": "Παρουσιάστηκε σφάλμα κατά την εξαγωγή σε CSV",
         "download_failed": "Η λήψη του CSV δεν είναι δυνατή",
@@ -3168,10 +3168,6 @@
             "title": "Επεξεργασία αγνοημένων συμβάντων"
           }
         }
-      },
-      "view": {
-        "hide": "Hide events",
-        "show": "Show events ({length})"
       }
     },
     "filter": {

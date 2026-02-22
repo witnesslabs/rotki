@@ -341,6 +341,9 @@
       "error": {
         "description": "Failed to query accounts for {blockchain}: {message}",
         "title": "Querying of accounts"
+      },
+      "task": {
+        "title": "Querying {blockchain} accounts"
       }
     },
     "history": {
@@ -1435,7 +1438,6 @@
     "title": "Manage Data"
   },
   "data_table": {
-    "items_no": "Artículos #",
     "no_data": "No hay datos disponibles",
     "rows_per_page": "Filas por página"
   },
@@ -2808,25 +2810,25 @@
     "progress": "{progress} %"
   },
   "purge_selector": {
+    "centralized_exchange": "Intercambio centralizado",
     "centralized_exchange_to_clear": {
       "hint": "Vacíe este campo para eliminar los datos de todos los intercambios centralizados",
       "label": "Intercambio centralizado para compensar"
     },
-    "centralized_exchanges": "Bolsas centralizadas",
     "chain_to_clear": {
       "hint": "Vacíe este campo para eliminar los datos de transacción de todas las cadenas",
       "label": "Cadena para borrar"
     },
+    "decentralized_exchange": "Intercambio descentralizado",
     "decentralized_exchange_to_clear": {
       "hint": "Vacía este campo para eliminar los datos de todos los intercambios descentralizados",
       "label": "Intercambio descentralizado para compensar"
     },
-    "decentralized_exchanges": "Intercambios descentralizados",
+    "defi_module": "Módulo DeFi",
     "defi_module_to_clear": {
       "hint": "Vacía este campo para eliminar los datos de todos los módulos defi",
       "label": "Módulo DeFi a borrar"
     },
-    "defi_modules": "Módulos DeFi",
     "label": "Seleccione una fuente de datos",
     "transactions": "Transacciones"
   },
@@ -3132,8 +3134,6 @@
       "headers": {
         "event_identifier": "Event information"
       },
-      "loading": "Loading events...",
-      "no_data": "Los eventos están ocultos porque contienen activos ignorados",
       "skipped": {
         "csv_export_error": "Hubo un error al exportar a CSV",
         "download_failed": "No es posible descargar el CSV",
@@ -3153,10 +3153,6 @@
             "title": "Eventos omitidos procesados"
           }
         }
-      },
-      "view": {
-        "hide": "Hide events",
-        "show": "Show events ({length})"
       }
     },
     "filter": {

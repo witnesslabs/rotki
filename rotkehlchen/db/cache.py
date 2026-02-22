@@ -7,6 +7,7 @@ from rotkehlchen.types import BTCAddress, ChecksumEvmAddress, SolanaAddress, Tim
 from rotkehlchen.utils.mixins.enums import Enum
 
 ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE: Final = -1
+IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX: Final = 'ignored_ced_'
 
 
 class DBCacheStatic(Enum):
@@ -77,11 +78,6 @@ class BinancePairLastTradeArgsType(TypedDict):
     queried_pair: str
 
 
-class IdentifierArgType(TypedDict):
-    """Type of kwargs, used to get the value of `DBCacheDynamic.MATCHED_ASSET_MOVEMENT`"""
-    identifier: int
-
-
 class CustomizedEventOriginalArgType(TypedDict):
     """Type of kwargs for `DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX`"""
     group_identifier: str
@@ -121,7 +117,6 @@ class DBCacheDynamic(Enum):
     LAST_BCH_TX_BLOCK: Final = 'last_bch_tx_block_{address}', _deserialize_int_from_str
     LINEA_AIRDROP_ALLOCATION: Final = 'linea_airdrop_allocation_{address}', lambda x: x
     SOLANA_TOKEN_ACCOUNT: Final = 'solana_token_account_{address}', _deserialize_solana_token_account_from_str  # noqa: E501
-    MATCHED_ASSET_MOVEMENT: Final = 'matched_asset_movement_{identifier}', _deserialize_int_from_str  # noqa: E501
     CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX: Final = 'customized_event_original_{group_identifier}_{sequence_index}', _deserialize_int_from_str  # noqa: E501
 
     @overload
@@ -142,10 +137,6 @@ class DBCacheDynamic(Enum):
 
     @overload
     def get_db_key(self, **kwargs: Unpack[IndexArgType]) -> str:
-        ...
-
-    @overload
-    def get_db_key(self, **kwargs: Unpack[IdentifierArgType]) -> str:
         ...
 
     @overload

@@ -2,7 +2,8 @@ import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from time import perf_counter
+from typing import TYPE_CHECKING, Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from rotkehlchen.assets.asset import Asset, AssetWithNameAndType
@@ -19,6 +20,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 log = RotkehlchenLogsAdapter(logger)
+
+
+def _normalize_asset_data_for_export(asset_data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize serialized asset entries so exported files can always be imported back."""
+    if asset_data.get('name') != '':
+        return asset_data
+
+    # Old/broken user entries may contain an empty name, but the import schema rejects it.
+    # Fall back to symbol when present, else to the identifier.
+    if isinstance(symbol := asset_data.get('symbol'), str) and symbol != '':
+        asset_data['name'] = symbol
+    else:
+        asset_data['name'] = asset_data['identifier']
+
+    return asset_data
 
 
 def import_assets_from_file(
@@ -86,35 +102,51 @@ def export_assets_from_file(
         dirpath = Path(tempfile.TemporaryDirectory().name)
         dirpath.mkdir(parents=True, exist_ok=True)
 
+    export_start = perf_counter()
     globaldb = GlobalDBHandler()
 
-    with db_handler.user_write() as write_cursor, globaldb.conn.read_ctx() as gdb_cursor:
+    assets_fetch_start = perf_counter()
+    with db_handler.conn.read_ctx() as user_cursor, globaldb.conn.read_ctx() as gdb_cursor:
         assets = globaldb.get_user_added_assets(
             cursor=gdb_cursor,
-            user_db_write_cursor=write_cursor,
+            user_db_cursor=user_cursor,
             user_db=db_handler,
         )
-    serialized = []
-    for asset_identifier in assets:
-        try:
-            asset = Asset(asset_identifier).resolve()
-            serialized.append(asset.to_dict())
-        except UnknownAsset as e:
-            log.error(e)
-
-    with globaldb.conn.read_ctx() as gdb_cursor:
+        log.debug(f'Exporting {len(assets)} user assets. Asset ids retrieval took {perf_counter() - assets_fetch_start:.3f}s')  # noqa: E501
         query = gdb_cursor.execute("SELECT value from settings WHERE name='version';")
         version = query.fetchone()[0]
-        data = {
-            'version': version,
-            'assets': serialized,
-        }
+
+    serialization_start = perf_counter()
+    serialized = []
+    found_assets: set[str] = set()
+    for asset in globaldb.retrieve_assets_optimized(list(assets)):
+        serialized.append(_normalize_asset_data_for_export(asset.to_dict()))
+        found_assets.add(asset.identifier)
+    log.debug(f'Optimized serialization wrote {len(serialized)} assets in {perf_counter() - serialization_start:.3f}s')  # noqa: E501
+
+    fallback_start = perf_counter()
+    missing_assets = assets - found_assets
+    for missing_asset in missing_assets:
+        try:
+            serialized.append(_normalize_asset_data_for_export(Asset(missing_asset).resolve().to_dict()))
+        except UnknownAsset as e:
+            log.error(e)
+    if len(missing_assets) != 0:
+        log.debug(f'Fallback-resolved {len(missing_assets)} assets in {perf_counter() - fallback_start:.3f}s')  # noqa: E501
+
+    json_start = perf_counter()
+    data = {
+        'version': version,
+        'assets': serialized,
+    }
+    json_data = json.dumps(data)
+    log.debug(f'JSON serialization took {perf_counter() - json_start:.3f}s')
 
     zip_path = dirpath / 'assets.zip'
+    zip_write_start = perf_counter()
     with ZipFile(file=zip_path, mode='w', compression=ZIP_DEFLATED) as assets_zip:
-        assets_zip.writestr(
-            zinfo_or_arcname='assets.json',
-            data=json.dumps(data),
-        )
+        assets_zip.writestr('assets.json', data=json_data)
+    log.debug(f'ZIP write took {perf_counter() - zip_write_start:.3f}s')
+    log.debug(f'Asset export completed with {len(serialized)} assets in {perf_counter() - export_start:.3f}s. Output: {zip_path}')  # noqa: E501
 
     return zip_path

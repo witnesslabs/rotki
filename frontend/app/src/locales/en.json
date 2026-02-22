@@ -504,6 +504,10 @@
         "description": "Failed to fetch customized event duplicates: {error}",
         "title": "Fetching Customized Event Duplicates"
       },
+      "fetch_events_error": {
+        "description": "Failed to load duplicate event details: {error}",
+        "title": "Loading Duplicate Events"
+      },
       "fix_error": {
         "description": "Failed to fix customized event duplicates: {error}",
         "title": "Fixing Customized Event Duplicates"
@@ -511,6 +515,14 @@
       "fix_success": {
         "description": "Successfully removed {count} duplicate event(s).",
         "title": "Duplicates Fixed"
+      },
+      "mark_non_duplicated_error": {
+        "description": "Failed to mark customized event duplicates as non-duplicated: {error}",
+        "title": "Marking Customized Event Duplicates as Non-Duplicated"
+      },
+      "unignore_error": {
+        "description": "Failed to restore ignored customized event duplicates: {error}",
+        "title": "Restoring Customized Event Duplicates"
       }
     },
     "date_range": " from {from}| to {to}| from {from} to {to}",
@@ -618,6 +630,9 @@
       "error": {
         "description": "Failed to query accounts for {blockchain}: {message}",
         "title": "Querying of accounts"
+      },
+      "task": {
+        "title": "Querying {blockchain} accounts"
       }
     },
     "history": {
@@ -786,6 +801,23 @@
         "task": {
           "title": "Create tax report"
         }
+      }
+    },
+    "repulling_eth_staking": {
+      "error": {
+        "description": "Failed to re-pull {entryType} events"
+      },
+      "success": {
+        "address_entry": "{address}: {count}",
+        "description": "{count} new {entryType} events re-pulled",
+        "no_events_description": "No new {entryType} events found",
+        "per_address": "Per address",
+        "per_validator": "Per validator",
+        "validator_entry": "Validator {index}: {count}"
+      },
+      "task": {
+        "description": "Re-pulling {entryType} events {dateRange}",
+        "title": "Re-pulling ETH staking events"
       }
     },
     "repulling_exchange_events": {
@@ -1224,14 +1256,18 @@
   "asset_movement_matching": {
     "actions": {
       "auto_match": "Trigger automatic matching",
-      "auto_match_tooltip": "Automatically match asset movements with corresponding on-chain events based on amount, asset, and timestamp.",
+      "auto_match_tooltip": "Automatically match asset movements with corresponding events based on amount, asset, and timestamp.",
       "ignore_fiat": "Ignore All Fiat",
-      "ignore_fiat_confirm": "Are you sure you want to ignore all {count} fiat currency movements? Fiat movements typically don't have corresponding on-chain events.",
-      "ignore_fiat_tooltip": "Ignore all fiat currency movements (e.g., USD, EUR). These typically don't have corresponding on-chain events.",
+      "ignore_fiat_confirm": "Are you sure you want to ignore all {count} fiat currency movements? Fiat movements typically don't have corresponding events.",
+      "ignore_fiat_tooltip": "Ignore all fiat currency movements (e.g., USD, EUR). These typically don't have corresponding events.",
       "ignore_selected": "Ignore Selected",
-      "ignore_selected_confirm": "Are you sure you want to ignore {count} selected asset movement(s)? This action marks them as having no corresponding on-chain event.",
-      "unignore_selected": "Unignore Selected",
-      "unignore_selected_confirm": "Are you sure you want to restore {count} selected asset movement(s) to the unmatched list?"
+      "ignore_selected_confirm": "Are you sure you want to ignore {count} selected asset movement(s)? This action marks them as having no corresponding event.",
+      "restore_selected": "Restore Selected",
+      "restore_selected_confirm": "Are you sure you want to restore {count} selected asset movement(s) to the unmatched list?"
+    },
+    "actions_pin": {
+      "pin_section": "Pin Section",
+      "unpin_section": "Unpin Section"
     },
     "auto_match": {
       "error": "Failed to run automatic matching: {error}",
@@ -1243,29 +1279,36 @@
       "message": "There are {count} unmatched asset movements that require manual matching."
     },
     "compact_notes": {
-      "deposit": "Deposit {amount} {asset} to {locationLabel} from {address}",
-      "withdraw": "Withdraw {amount} {asset} from {locationLabel} to {address}"
+      "deposit": "Deposit {amount} {asset}{to}{from}",
+      "from_part": " from {address}",
+      "to_part": " to {locationLabel}",
+      "withdraw": "Withdraw {amount} {asset}{from}{to}"
     },
     "dialog": {
+      "compacted_info": "Date\nEvent Type - Subtype",
       "confirm_match": "Confirm Match",
-      "description": "Select an unmatched asset movement and find a matching blockchain transaction to link them together.",
+      "description": "Select an unmatched asset movement and find matching blockchain transactions to link them together.",
       "find_match": "Find Match",
       "ignore": "Ignore",
-      "ignore_tooltip": "Mark this asset movement as having no corresponding on-chain event.",
+      "ignore_tooltip": "Mark this asset movement as having no corresponding event.",
+      "ignored_description": "These asset movements have been marked as having no corresponding event. Restore them to retry matching.",
+      "info_column": "Info",
       "manual_action": "Manual Action",
-      "matching_for": "Matching for:",
+      "matching_for": "Finding matches for the following asset movement.",
+      "matching_hint": "You can select one or more events to link.",
       "no_ignored": "No ignored asset movements.",
       "no_matches_found": "No potential matches found. Try adjusting the time range.",
       "no_unmatched": "All asset movements have been matched.",
-      "only_expected_assets": "Only show same assets",
+      "only_expected_assets": "Only show \nsame assets",
       "only_expected_assets_hint": "When enabled, only show events that are from or to addresses that belong to your tracked accounts, with matching amounts and timestamps.",
       "recommended": "Recommended",
       "restore": "Restore",
       "restore_tooltip": "Restore this asset movement to the unmatched list.",
-      "search_description": "Search for on-chain events within the specified criteria:",
+      "search_description": "Search for events within the specified criteria:",
       "select": "Select",
       "select_match_title": "Select Matching Event",
       "selected": "Selected",
+      "show_in_events": "Show in history events",
       "time_range_hours": "Time range (hours)",
       "title": "Match Asset Movements"
     },
@@ -1803,7 +1846,6 @@
       "filter": "Filter",
       "finish": "Finish",
       "generate": "Generate",
-      "hide": "Hide",
       "import": "Import",
       "install": "Install",
       "next": "Next",
@@ -1815,7 +1857,6 @@
       "save": "Save",
       "search": "Search",
       "select_all": "Select All",
-      "show": "Show",
       "show_less": "Show less",
       "show_more_num": "Show {count} more",
       "skip": "Skip",
@@ -2034,7 +2075,18 @@
       "fix_selected": "Auto Fix Selected Group",
       "fix_selected_confirm": "Are you sure you want to fix {count} selected duplicate event(s)?",
       "fix_single": "Fix Duplicate",
-      "fix_single_confirm": "Are you sure you want to fix this duplicate event? This will remove the duplicate on-chain event and keep your customized event."
+      "fix_single_confirm": "Are you sure you want to fix this duplicate event? This will remove the duplicate on-chain event and keep your customized event.",
+      "mark_non_duplicated": "Mark as Non-Duplicated",
+      "mark_non_duplicated_confirm": "Are you sure you want to mark this event as non-duplicated?",
+      "mark_non_duplicated_selected": "Mark Selected as Non-Duplicated",
+      "mark_non_duplicated_selected_confirm": "Are you sure you want to mark {count} selected event(s) as non-duplicated?",
+      "mark_non_duplicated_tooltip": "Mark this duplicate as a false positive and hide it from future checks.",
+      "restore": "Restore",
+      "restore_confirm": "Are you sure you want to restore this ignored duplicate event?",
+      "restore_selected": "Restore Selected",
+      "restore_selected_confirm": "Are you sure you want to restore {count} ignored duplicate event(s)?",
+      "restore_tooltip": "Restore this ignored duplicate so it appears in the review list again.",
+      "show_in_history": "Show in History Events"
     },
     "banner": {
       "auto_fix_message": "{count} duplicate event(s) can be auto-fixed.",
@@ -2048,6 +2100,21 @@
       "resolved_count": "{count} duplicate(s) resolved.",
       "viewing_auto_fixable": "Showing auto-fixable duplicate events",
       "viewing_manual_review": "Showing duplicates requiring manual review"
+    },
+    "columns": {
+      "tx_hash": "Transaction"
+    },
+    "dialog": {
+      "auto_fix_description": "These duplicates can be automatically resolved by removing the on-chain event and keeping your customized event.",
+      "manual_review_description": "These duplicates require manual review. Inspect them in the history events view to decide how to handle them.",
+      "non_duplicated_description": "These events have been marked as non-duplicated and are excluded from checks.",
+      "title": "Duplicate Events"
+    },
+    "no_items": "No duplicate events found.",
+    "tabs": {
+      "auto_fix": "Can Be Auto-Fixed",
+      "manual_review": "Needs Manual Review",
+      "non_duplicated": "Marked as Non-Duplicated"
     }
   },
   "dashboard": {
@@ -2225,6 +2292,7 @@
   "data_management": {
     "purge_data": {
       "confirm": {
+        "exchange_trade_history_warning": "Please note that {exchange} only allows retrieving the last {days} days of trade history. Any older trades will be permanently lost.",
         "message": "Are you sure you want to purge the cached data for {source} ({value})?",
         "message_all": "Are you sure you want to purge the cached data for all {source}?",
         "title": "Confirm cached data purge"
@@ -2270,7 +2338,6 @@
     "title": "Manage Data"
   },
   "data_table": {
-    "items_no": "Items #",
     "no_data": "No data available",
     "rows_per_page": "Rows per page"
   },
@@ -3402,7 +3469,9 @@
   },
   "history_events_list_swap": {
     "fee_description": "{notes} with fee: {feeText}",
-    "swap_description": "Swap {spendAmount} {spendAsset} for {receiveAmount} {receiveAsset}"
+    "movement_expanded": "Linked movement ({count} events) - click to collapse",
+    "swap_description": "Swap {spendAmount} {spendAsset} for {receiveAmount} {receiveAsset}",
+    "swap_expanded": "Swap ({count} events) - click to collapse"
   },
   "history_redecode_selection": {
     "redecode": "Recode {total} chains",
@@ -3417,6 +3486,7 @@
   },
   "history_refresh_selection": {
     "back_to_chain": "Back to chain selection",
+    "non_syncing_hint": "{count} exchange is excluded from syncing | {count} exchanges are excluded from syncing",
     "refresh": "Refresh {total} {type}",
     "refresh_disabled": "Refreshing {service} is disabled because the required API key is not configured",
     "search_address": "Search by address",
@@ -3626,6 +3696,7 @@
   },
   "kraken_page": {
     "loading": "Your Kraken staking information is loading...",
+    "no_premium": "Upgrade to premium to access Kraken staking information",
     "page": {
       "api_key": "API key",
       "description": "To see your staking information you need to add a Kraken {link}",
@@ -4121,6 +4192,9 @@
         "title": "{service} API key for {location}"
       }
     },
+    "monerium_session_key_expired": {
+      "title": "Monerium session key expired"
+    },
     "new_detected_token": {
       "action": "See more",
       "message": "New token with identifier {identifier} was detected from event processing and queries.|{count} new tokens were detected from event processing and queries.",
@@ -4548,6 +4622,7 @@
       "delete": "Delete Key",
       "replace": "Replace Key",
       "setup": "Setup",
+      "setup_premium_key": "Setup Premium Key",
       "sync": "Allow data sync with rotki Server",
       "sync_hint": "Your data is encrypted before being synced to the rotki server and cannot be read by anyone except you."
     },
@@ -4797,25 +4872,25 @@
     "ds_proxy": "DS Proxy:"
   },
   "purge_selector": {
+    "centralized_exchange": "Centralized Exchange",
     "centralized_exchange_to_clear": {
       "hint": "Empty this field to remove the data for all centralized exchanges",
       "label": "Centralized exchange to clear"
     },
-    "centralized_exchanges": "Centralized Exchanges",
     "chain_to_clear": {
       "hint": "Empty this field to remove the transaction data for all chains",
       "label": "Chain to clear"
     },
+    "decentralized_exchange": "Decentralized Exchange",
     "decentralized_exchange_to_clear": {
       "hint": "Empty this field to remove the data for all decentralized exchanges",
       "label": "Decentralized exchange to clear"
     },
-    "decentralized_exchanges": "Decentralized Exchanges",
+    "defi_module": "DeFi Module",
     "defi_module_to_clear": {
       "hint": "Empty this field to remove the data for all defi modules",
       "label": "DeFi module to clear"
     },
-    "defi_modules": "DeFi Modules",
     "eth_block": "ETH Block Events",
     "eth_withdrawals": "ETH Withdrawal Events",
     "label": "Select a data source",
@@ -4935,11 +5010,15 @@
         "submit": "Add node operator",
         "title": "Track a node operator",
         "validation": {
-          "invalid_id": "Use a non-negative whole number"
+          "invalid_id": "Use a non-negative whole number",
+          "non_empty_address": "An address is required",
+          "non_empty_id": "A node operator ID is required"
         }
       },
       "messages": {
         "add_failed": "Failed to add the node operator: {message}",
+        "confirm_delete_message": "Are you sure you want to remove node operator #{nodeOperatorId} for {address}?",
+        "confirm_delete_title": "Delete node operator",
         "delete_failed": "Failed to remove the node operator: {message}",
         "fetch_failed": "Failed to query the Lido CSM node operators: {message}"
       },
@@ -5248,10 +5327,8 @@
     "alerts": {
       "button": "Actions needed",
       "check_duplicate_events": "Check duplicate events",
-      "check_issues": "Check issues",
       "check_unmatched_movements": "Check unmatched movements",
-      "refresh_duplicate_events": "Refresh duplicate events",
-      "refresh_unmatched_movements": "Refresh unmatched movements",
+      "no_issues_found": "No issues found",
       "title": "There are actions needed for your events"
     },
     "dialog": {
@@ -5264,6 +5341,11 @@
         "message": "Are you sure you want to delete this transaction and its events? You will have to purge all transactions or add by the transaction hash to restore them.",
         "title": "Delete transaction and events"
       }
+    },
+    "empty_state": {
+      "clear_filters": "Clear filters",
+      "no_data_with_filters": "No events match the current filters",
+      "no_events": "No events found.\nAdd exchanges, track blockchain addresses, or manually add events to get started."
     },
     "events": {
       "accounting_rule": {
@@ -5332,9 +5414,9 @@
         }
       },
       "event_states": {
-        "auto_matched": "Auto matched",
         "customized": "Customized",
         "imported_from_csv": "Imported from CSV",
+        "matched": "Matched",
         "profit_adjustment": "Profit adjustment"
       },
       "export": {
@@ -5501,6 +5583,7 @@
         "history_event": "{location} event",
         "swap_event": "Swap on {location}"
       },
+      "hidden_ignored_assets_warning": "Some events in this group are hidden because they contain ignored assets. Click to show.",
       "ignore": {
         "error": {
           "message": "Failed to ignore events in accounting",
@@ -5509,10 +5592,6 @@
         "success": "{count} transaction ignored successfully | {count} transactions ignored successfully",
         "title": "Ignore Transactions"
       },
-      "ignored_assets_hidden": "Some events in this group are hidden because they contain ignored assets.",
-      "ignored_assets_shown": "Showing all events including those with ignored assets.",
-      "loading": "Loading events...",
-      "no_data": "Events are hidden because they contain ignored assets",
       "note": {
         "merchant_code": "Merchant Code: {code}"
       },
@@ -5529,7 +5608,8 @@
         "unignore": "Unignore in accounting"
       },
       "show_missing_acquisition": "Showing event for missing acquisition",
-      "show_negative_balance": "Showing event where negative balances detected",
+      "show_negative_balance": "Highlighting event where negative balances detected",
+      "showing_ignored_assets": "Showing all events including those with ignored assets. Click to hide.",
       "skipped": {
         "csv_export_error": "There was an error with export",
         "download_failed": "Download of CSV is not possible",
@@ -5551,23 +5631,8 @@
         }
       },
       "unlink_error": "Failed to unlink asset movement",
-      "unlink_no_asset_movement": "No asset movement event found in this group",
-      "unsupported": {
-        "description_gas_fee_only": "This transaction only contains a gas fee with no other events. This typically means we don't yet understand what this transaction does.",
-        "description_incomplete_swap": "This swap appears to be incomplete. It has one side of the trade but is missing the other.",
-        "location": "- Location: {location}",
-        "more_detail": "More detail:",
-        "placeholder": "[Add more context here]",
-        "report_action": "Report Transaction",
-        "report_description_intro_gas_fee_only": "I found a transaction that appears to be unsupported (only gas fee event).",
-        "report_description_intro_incomplete_swap": "I found a swap transaction that appears to be incomplete (missing one side of the trade).",
-        "title": "Unsupported Transaction",
-        "tx_hash": "- Tx Hash: {hash}"
-      },
       "view": {
-        "hide": "Hide events",
-        "load_more": "Load more events ({length})",
-        "show": "Show events ({length})"
+        "load_more": "Load more events ({length})"
       }
     },
     "events_decoding": {
@@ -5588,6 +5653,7 @@
       "fetching": "Checking transaction decoding status",
       "preparing": "Decoding transactions, please wait...",
       "progress": "Progress",
+      "redecode": "Redecode",
       "redecode_all": "Redecode All Transactions",
       "title": "Transaction decoding status",
       "transactions_processed": "{processed} / {total} transactions processed",
@@ -5597,7 +5663,6 @@
       "account": "Filter by account",
       "address": "filter by counterparty address",
       "asset": "filter by the asset of the events",
-      "customized_only": "Show only customized events",
       "date_hint": "format {format} HH:mm:ss (time/seconds are optional)",
       "end_date": "filter by the end date of the transaction period",
       "entry_type": "filter by entry type",
@@ -5610,9 +5675,9 @@
       "protocol": "filter by the protocol of the events",
       "show_ignored_assets": "Show entries with ignored assets",
       "start_date": "filter by the start date of the transaction period",
+      "state_markers": "Filter by state",
       "tx_hash": "filter by tx hash(es) or signature(s)",
-      "validator_index": "filter by validator index(es)",
-      "virtual_only": "Show only auto-generated events"
+      "validator_index": "filter by validator index(es)"
     },
     "form": {
       "account": {
@@ -5648,6 +5713,20 @@
       "confirmation": {
         "message": "This action may take some time to complete. Are you sure you want to proceed?",
         "title": "Confirm re-pull"
+      },
+      "eth_staking": {
+        "addresses_hint": "Optional. Leave empty to refetch for all tracked withdrawal addresses.",
+        "addresses_label": "Withdrawal Addresses",
+        "block_productions_warning": "Refetching block productions requires extensive beaconcha.in API usage. This may take a while and consume a significant number of API calls.",
+        "filter_by_label": "Filter By",
+        "filter_mode": {
+          "addresses": "Withdrawal Addresses",
+          "validator_indices": "Validator Indices"
+        },
+        "no_validators": "You don't have any ETH validators tracked. Please add validators first.",
+        "tab": "ETH Staking",
+        "type_label": "Event Type",
+        "validator_indices_hint": "Optional. Leave empty to refetch for all tracked validators."
       },
       "loading_tooltip": "Re-pulling is currently disabled because the transactions are still being fetched. Please wait a moment.",
       "no_accounts": "You don't have any blockchain accounts registered. Please {link} first.",

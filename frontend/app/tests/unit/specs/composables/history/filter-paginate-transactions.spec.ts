@@ -1,10 +1,9 @@
-import type { Account } from '@rotki/common/src/account';
 import type { MaybeRef } from 'vue';
 import type * as Vue from 'vue';
 import type { HistoryEventRequestPayload } from '@/modules/history/events/request-types';
 import type { Collection } from '@/types/collection';
 import type { HistoryEvent, HistoryEventRow } from '@/types/history/events/schemas';
-import { Blockchain } from '@rotki/common';
+import { type Account, Blockchain } from '@rotki/common';
 import flushPromises from 'flush-promises';
 import { afterEach, assertType, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { type Filters, type Matcher, useHistoryEventFilter } from '@/composables/filters/events';
@@ -13,23 +12,6 @@ import { usePaginationFilters } from '@/composables/use-pagination-filter';
 import { useMainStore } from '@/store/main';
 import { FilterBehaviour } from '@/types/filtering';
 import { type LocationQuery, RouterAccountsSchema } from '@/types/route';
-
-vi.mock('vue-router', async () => {
-  const { ref } = await import('vue');
-  const { set } = await import('@vueuse/core');
-  const route = ref({
-    query: {},
-  });
-  return {
-    useRoute: vi.fn().mockReturnValue(route),
-    useRouter: vi.fn().mockReturnValue({
-      push: vi.fn(({ query }) => {
-        set(route, { query });
-        return true;
-      }),
-    }),
-  };
-});
 
 vi.mock('vue', async () => {
   const mod = await vi.importActual<typeof Vue>('vue');

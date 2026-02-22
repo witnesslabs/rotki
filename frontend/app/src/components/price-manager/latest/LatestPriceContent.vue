@@ -179,7 +179,7 @@ onMounted(async () => {
           <FiatDisplay
             :value="row.usdPrice"
             :loading="!row.usdPrice || row.usdPrice.lt(0)"
-            from="USD"
+            :price-asset="row.fromAsset"
           />
         </template>
         <template #item.actions="{ row }">

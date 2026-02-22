@@ -4,7 +4,7 @@ from contextlib import suppress
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-from pysqlcipher3 import dbapi2 as sqlcipher
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.api.rest_helpers.history_events import edit_grouped_events_with_optional_fee
 from rotkehlchen.db.constants import HISTORY_MAPPING_KEY_STATE, HistoryMappingState
@@ -105,6 +105,7 @@ class HistoryEventsService:
                     events_db.edit_history_event(
                         event=event,
                         write_cursor=write_cursor,
+                        mapping_state=HistoryMappingState.CUSTOMIZED,
                     )
         except InputError as e:
             return {

@@ -546,7 +546,6 @@ CREATE TABLE IF NOT EXISTS history_events (
 );
 """
 
-
 # Table that extends history_events table and stores chain-agnostic transaction metadata.
 DB_CREATE_CHAIN_EVENTS_INFO = """
 CREATE TABLE IF NOT EXISTS chain_events_info (
@@ -582,6 +581,12 @@ CREATE TABLE IF NOT EXISTS history_events_mappings (
 );
 """  # noqa: E501
 
+# Duplicate tables for storing backup copies of history events before editing them so they can be
+# restored to their original state later. Used in asset movement matching.
+DB_CREATE_HISTORY_EVENTS_BACKUP = DB_CREATE_HISTORY_EVENTS.replace('history_events', 'history_events_backup')  # noqa: E501
+DB_CREATE_CHAIN_EVENTS_INFO_BACKUP = DB_CREATE_CHAIN_EVENTS_INFO.replace(
+    'chain_events_info', 'chain_events_info_backup',
+).replace('history_events', 'history_events_backup')
 
 # usd_price is a column of the table because we sort by price in the fiat currency and that price
 # needs to be calculated from last_price and the price of last_price_asset. If we don't sort using
@@ -696,6 +701,26 @@ DB_CREATE_KEY_VALUE_CACHE = """CREATE TABLE IF NOT EXISTS key_value_cache (
     value TEXT
 );"""
 
+DB_CREATE_HISTORY_EVENT_LINKS = """
+CREATE TABLE IF NOT EXISTS history_event_links (
+    left_event_id INTEGER NOT NULL,
+    right_event_id INTEGER NOT NULL,
+    link_type INTEGER NOT NULL,
+    PRIMARY KEY (left_event_id, link_type, right_event_id),
+    FOREIGN KEY(left_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+    FOREIGN KEY(right_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+    UNIQUE(right_event_id, link_type)
+);
+"""
+
+DB_CREATE_HISTORY_EVENT_LINK_IGNORES = """
+CREATE TABLE IF NOT EXISTS history_event_link_ignores (
+    event_id INTEGER NOT NULL,
+    link_type INTEGER NOT NULL,
+    PRIMARY KEY (event_id, link_type),
+    FOREIGN KEY(event_id) REFERENCES history_events(identifier) ON DELETE CASCADE
+);
+"""
 
 DB_CREATE_CALENDAR = """
 CREATE TABLE IF NOT EXISTS calendar (
@@ -860,6 +885,22 @@ CREATE TABLE IF NOT EXISTS lido_csm_node_operator_metrics (
 );
 """
 
+# Cache for historical on-chain balance queries (by block).
+# timestamp is the queried timestamp in seconds.
+DB_CREATE_HISTORICAL_BALANCE_CACHE = """
+CREATE TABLE IF NOT EXISTS historical_balance_cache (
+    id INTEGER NOT NULL PRIMARY KEY,
+    blockchain TEXT NOT NULL,
+    address TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    UNIQUE(blockchain, address, asset, block_number)
+);
+"""
+
 # Stores metrics for history events including balance, pnl, and cost_basis data.
 # Each row represents a metric for a specific bucket after the event is applied.
 # Bucket = (location, location_label, protocol, asset) where:
@@ -868,7 +909,7 @@ CREATE TABLE IF NOT EXISTS lido_csm_node_operator_metrics (
 # - metric_key is the type of metric ('balance', 'pnl', 'cost_basis', etc.)
 # - asset is the identifier this metric is aggregated under (may differ from event asset,
 #   e.g., token upgrades)
-DB_CREATE_EVENT_METRICS = """
+"""
 CREATE TABLE IF NOT EXISTS event_metrics (
     id INTEGER NOT NULL PRIMARY KEY,
     event_identifier INTEGER NOT NULL REFERENCES history_events(identifier) ON DELETE CASCADE,
@@ -904,7 +945,14 @@ CREATE INDEX IF NOT EXISTS idx_history_events_asset ON history_events(asset);
 CREATE INDEX IF NOT EXISTS idx_history_events_type ON history_events(type);
 CREATE INDEX IF NOT EXISTS idx_history_events_subtype ON history_events(subtype);
 CREATE INDEX IF NOT EXISTS idx_history_events_ignored ON history_events(ignored);
+CREATE INDEX IF NOT EXISTS idx_history_event_links_right ON history_event_links(right_event_id);
+CREATE INDEX IF NOT EXISTS idx_history_event_links_composite ON history_event_links(link_type, left_event_id, right_event_id);
+CREATE INDEX IF NOT EXISTS idx_history_event_link_ignores_type ON history_event_link_ignores(link_type);
 CREATE UNIQUE INDEX IF NOT EXISTS unique_generic_accounting_rules ON accounting_rules(type, subtype, counterparty) WHERE is_event_specific = 0;
+"""  # noqa: E501
+
+# The event metrics table is temporarily removed.
+"""
 CREATE INDEX IF NOT EXISTS idx_event_metrics_event ON event_metrics(event_identifier);
 CREATE INDEX IF NOT EXISTS idx_event_metrics_location_label ON event_metrics(location_label);
 CREATE INDEX IF NOT EXISTS idx_event_metrics_protocol ON event_metrics(protocol);
@@ -954,6 +1002,8 @@ BEGIN TRANSACTION;
 {DB_CREATE_CHAIN_EVENTS_INFO}
 {DB_CREATE_ETH_STAKING_EVENTS_INFO}
 {DB_CREATE_HISTORY_EVENTS_MAPPINGS}
+{DB_CREATE_HISTORY_EVENTS_BACKUP}
+{DB_CREATE_CHAIN_EVENTS_INFO_BACKUP}
 {DB_CREATE_IGNORED_ACTIONS}
 {DB_CREATE_NFTS}
 {DB_CREATE_ENS_MAPPINGS}
@@ -966,6 +1016,8 @@ BEGIN TRANSACTION;
 {DB_CREATE_MAPPED_ACCOUNTING_RULES}
 {DB_CREATE_UNRESOLVED_REMOTE_CONFLICTS}
 {DB_CREATE_KEY_VALUE_CACHE}
+{DB_CREATE_HISTORY_EVENT_LINKS}
+{DB_CREATE_HISTORY_EVENT_LINK_IGNORES}
 {DB_CREATE_CALENDAR}
 {DB_CREATE_CALENDAR_REMINDERS}
 {DB_CREATE_COWSWAP_ORDERS}
@@ -979,7 +1031,7 @@ BEGIN TRANSACTION;
 {DB_CREATE_SOLANA_ATA_ADDRESS_MAPPINGS}
 {DB_CREATE_LIDO_CSM_NODE_OPERATORS}
 {DB_CREATE_LIDO_CSM_NODE_OPERATOR_METRICS}
-{DB_CREATE_EVENT_METRICS}
+{DB_CREATE_HISTORICAL_BALANCE_CACHE}
 {DB_CREATE_INDEXES}
 COMMIT;
 PRAGMA foreign_keys=on;

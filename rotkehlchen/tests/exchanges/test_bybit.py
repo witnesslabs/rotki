@@ -17,7 +17,7 @@ from rotkehlchen.exchanges.bybit import Bybit, bybit_symbol_to_base_quote
 from rotkehlchen.fval import FVal
 from rotkehlchen.history.events.structures.asset_movement import AssetMovement
 from rotkehlchen.history.events.structures.swap import SwapEvent
-from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.history.events.structures.types import HistoryEventSubType
 from rotkehlchen.tests.utils.constants import A_SOL, A_XRP
 from rotkehlchen.types import Location, Timestamp, TimestampMS
 from rotkehlchen.utils.misc import ts_now
@@ -274,7 +274,7 @@ def test_deposit_withdrawals(bybit_exchange: Bybit) -> None:
             timestamp=TimestampMS(1701200911000),
             location=Location.BYBIT,
             location_label=bybit_exchange.name,
-            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.RECEIVE,
             asset=A_USDC,
             amount=FVal('79.993947'),
             unique_id='0xe9bce05f14cb35eeb762ed5ce109ab4676ed1459480f6196c82060c4e0c63b27',
@@ -283,7 +283,7 @@ def test_deposit_withdrawals(bybit_exchange: Bybit) -> None:
             timestamp=TimestampMS(1701200780000),
             location=Location.BYBIT,
             location_label=bybit_exchange.name,
-            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.RECEIVE,
             asset=A_USDC,
             amount=FVal('20'),
             unique_id='0xc2433faf5938e4be896127a15815952e99b41412b8aa0fbe239ce24c8bc435ab',
@@ -348,3 +348,31 @@ def test_query_trades_range(bybit_exchange: Bybit) -> None:
     assert range_calls[0] == (oldest_plus_delta, oldest_plus_delta + DAY_IN_SECONDS * 7)
     assert range_calls[1][1] - range_calls[1][0] == DAY_IN_SECONDS * 7
     assert range_calls[-1][1] == end_ts
+
+
+def test_paginated_query_stops_without_cursor_on_full_page(bybit_exchange: Bybit) -> None:
+    """When nextPageCursor is empty we should stop even if page has `limit` entries."""
+    call_count = 0
+
+    def mock_fn(path: str, options: dict[str, Any]) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:
+            raise AssertionError('pagination should stop after first full page without cursor')
+
+        assert path == 'order/history'
+        assert options['limit'] == 50
+        return {
+            'nextPageCursor': '',
+            'category': 'spot',
+            'list': [{'orderId': str(i)} for i in range(50)],
+        }
+
+    with patch.object(bybit_exchange, '_api_query', side_effect=mock_fn):
+        result = bybit_exchange._paginated_api_query(
+            endpoint='order/history',
+            options={'limit': 50},
+        )
+
+    assert len(result) == 50
+    assert call_count == 1

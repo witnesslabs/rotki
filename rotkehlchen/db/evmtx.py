@@ -1,7 +1,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, ClassVar, get_args
 
-from pysqlcipher3 import dbapi2 as sqlcipher
+from sqlcipher3 import dbapi2 as sqlcipher
 
 from rotkehlchen.chain.arbitrum_one.constants import ARBITRUM_ONE_GENESIS
 from rotkehlchen.chain.base.constants import BASE_GENESIS
@@ -155,6 +155,19 @@ class DBEvmTx(DBCommonTx[ChecksumEvmAddress, EvmTransaction, EVMTxHash, EvmTrans
             relevant_address=relevant_address,
         )
 
+    def delete_evm_internal_transactions_by_parent_tx_hash(
+            self,
+            write_cursor: 'DBCursor',
+            parent_tx_hash: EVMTxHash,
+            chain_id: ChainID,
+    ) -> None:
+        """Delete all internal transactions for a single parent tx hash and chain."""
+        write_cursor.execute(
+            'DELETE FROM evm_internal_transactions WHERE parent_tx IN ('
+            'SELECT identifier FROM evm_transactions WHERE tx_hash=? AND chain_id=?)',
+            (parent_tx_hash, chain_id.serialize_for_db()),
+        )
+
     def get_evm_internal_transactions(
             self,
             parent_tx_hash: EVMTxHash,
@@ -204,7 +217,7 @@ class DBEvmTx(DBCommonTx[ChecksumEvmAddress, EvmTransaction, EVMTxHash, EvmTrans
         the given filter query
 
         This function can raise:
-        - pysqlcipher3.dbapi2.OperationalError if the SQL query fails due to invalid
+        - sqlcipher3.dbapi2.OperationalError if the SQL query fails due to invalid
         filtering arguments.
         """
         query, bindings = filter_.prepare()
@@ -320,7 +333,7 @@ class DBEvmTx(DBCommonTx[ChecksumEvmAddress, EvmTransaction, EVMTxHash, EvmTrans
         May raise:
         - Key Error if any of the expected fields are missing
         - DeserializationError if there is a problem deserializing a value
-        - pysqlcipher3.dbapi2.IntegrityError if the transaction hash is not in the DB:
+        - sqlcipher3.dbapi2.IntegrityError if the transaction hash is not in the DB:
         """
         tx_hash_b = hexstring_to_bytes(data['transactionHash'])
         # some nodes miss the type field for older non EIP1559 transactions. So assume legacy (0)

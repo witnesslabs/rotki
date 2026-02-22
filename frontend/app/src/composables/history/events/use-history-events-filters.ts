@@ -1,13 +1,19 @@
 import type { DataTableSortData, TablePaginationData } from '@rotki/ui-library';
-import type { ComputedRef, Ref } from 'vue';
+import type { ComputedRef, MaybeRef, Ref } from 'vue';
 import type { HistoryEventsToggles } from '@/components/history/events/dialog-types';
 import type { HistoryEventRequestPayload } from '@/modules/history/events/request-types';
 import type { Collection } from '@/types/collection';
 import type { HistoryEventRow } from '@/types/history/events/schemas';
 import { type Account, type HistoryEventEntryType, toSnakeCase, type Writeable } from '@rotki/common';
+import { startPromise } from '@shared/utils';
+import { objectOmit } from '@vueuse/shared';
 import { isEqual } from 'es-toolkit';
 import { type Filters, type Matcher, useHistoryEventFilter } from '@/composables/filters/events';
 import { useHistoryEvents } from '@/composables/history/events';
+import { isValidHistoryEventState } from '@/composables/history/events/mapping/state';
+import { DuplicateHandlingStatus, type HighlightType } from '@/composables/history/events/types';
+import { HIGHLIGHT_FETCH_DEBOUNCE, HIGHLIGHT_FILTER_DEBOUNCE, useHistoryEventNavigation } from '@/composables/history/events/use-history-event-navigation';
+import { useRefWithDebounce } from '@/composables/ref';
 import { usePaginationFilters } from '@/composables/use-pagination-filter';
 import { TableId } from '@/modules/table/use-remember-table-sorting';
 import { RouterLocationLabelsSchema } from '@/types/route';
@@ -16,14 +22,9 @@ import {
   isOnlineHistoryEventType,
 } from '@/utils/history/events';
 
+export { useHistoryEventNavigationConsumer } from '@/composables/history/events/use-history-event-navigation-consumer';
+
 type Period = { fromTimestamp?: string; toTimestamp?: string } | { fromTimestamp?: number; toTimestamp?: number };
-
-export const DuplicateHandlingStatus = {
-  AUTO_FIX: 'auto-fix',
-  MANUAL_REVIEW: 'manual-review',
-} as const;
-
-export type DuplicateHandlingStatus = (typeof DuplicateHandlingStatus)[keyof typeof DuplicateHandlingStatus];
 
 interface HistoryEventsFiltersOptions {
   entryTypes: Ref<HistoryEventEntryType[] | undefined>;
@@ -38,7 +39,16 @@ interface HistoryEventsFiltersOptions {
   validators: Ref<number[] | undefined>;
 }
 
+export function getDefaultToggles(): HistoryEventsToggles {
+  return {
+    matchExactEvents: false,
+    showIgnoredAssets: false,
+    stateMarkers: [],
+  };
+}
+
 interface UseHistoryEventsFiltersReturn {
+  clearFilters: () => void;
   duplicateHandlingStatus: ComputedRef<DuplicateHandlingStatus | undefined>;
   locationLabels: Ref<string[]>;
   groupIdentifiers: ComputedRef<string[] | undefined>;
@@ -46,10 +56,11 @@ interface UseHistoryEventsFiltersReturn {
   filters: ComputedRef<Filters>;
   groupLoading: Ref<boolean>;
   groups: Ref<Collection<HistoryEventRow>>;
+  hasActiveFilters: ComputedRef<boolean>;
   highlightedIdentifiers: ComputedRef<string[] | undefined>;
+  highlightTypes: ComputedRef<Record<string, HighlightType>>;
   identifiers: ComputedRef<string[] | undefined>;
   includes: ComputedRef<{ evmEvents: boolean; onlineEvents: boolean }>;
-  locationOverview: Ref<string | undefined>;
   locations: ComputedRef<string[]>;
   matchers: ComputedRef<Matcher[]>;
   onLocationLabelsChanged: (locationLabels: string[]) => void;
@@ -80,24 +91,35 @@ export function useHistoryEventsFilters(
   } = options;
 
   const locationLabels = ref<string[]>([]);
-  const locationOverview = ref(get(location));
+
+  const GROUPS_CANCEL_TAG = 'history-events-groups';
 
   const route = useRoute();
   const { fetchHistoryEvents } = useHistoryEvents();
+  const { findHighlightPage } = useHistoryEventNavigation();
 
-  // Define these early since they're used in extraParams
-  const identifiersFromQuery = computed<string[] | undefined>(() => {
-    const { identifiers } = get(route).query;
-    return identifiers ? [identifiers as string] : undefined;
+  const fetchHistoryEventsTagged = async (
+    payload: MaybeRef<HistoryEventRequestPayload>,
+  ): Promise<Collection<HistoryEventRow>> =>
+    fetchHistoryEvents(payload, { tags: [GROUPS_CANCEL_TAG] });
+
+  // Define these early since they're used in extraParams / requestParams
+  const missingAcquisitionFromQuery = computed<string[] | undefined>(() => {
+    const { missingAcquisitionIdentifier } = get(route).query;
+    return missingAcquisitionIdentifier ? [missingAcquisitionIdentifier as string] : undefined;
+  });
+
+  const groupIdentifiersRaw = computed<string | undefined>(() => {
+    const { groupIdentifiers } = get(route).query;
+    return groupIdentifiers ? (groupIdentifiers as string) : undefined;
   });
 
   const groupIdentifiersFromQuery = computed<string[] | undefined>(() => {
-    const { groupIdentifiers } = get(route).query;
-    if (!groupIdentifiers)
+    const raw = get(groupIdentifiersRaw);
+    if (!raw)
       return undefined;
 
-    const ids = groupIdentifiers as string;
-    return ids.includes(',') ? ids.split(',') : [ids];
+    return raw.includes(',') ? raw.split(',') : [raw];
   });
 
   const duplicateHandlingStatusFromQuery = computed<DuplicateHandlingStatus | undefined>(() => {
@@ -133,7 +155,8 @@ export function useHistoryEventsFilters(
     HistoryEventRequestPayload,
     Filters,
     Matcher
-  >(fetchHistoryEvents, {
+  >(fetchHistoryEventsTagged, {
+    cancelTag: GROUPS_CANCEL_TAG,
     defaultParams: computed(() => {
       if (isDefined(entryTypes) && get(entryTypes)) {
         return {
@@ -144,13 +167,15 @@ export function useHistoryEventsFilters(
       }
       return {};
     }),
-    extraParams: computed(() => ({
-      customizedEventsOnly: get(toggles, 'customizedEventsOnly'),
-      excludeIgnoredAssets: !get(toggles, 'showIgnoredAssets'),
-      groupIdentifiers: get(groupIdentifiersFromQuery),
-      identifiers: get(identifiersFromQuery),
-      virtualEventsOnly: get(toggles, 'virtualEventsOnly'),
-    })),
+    fetchDebounce: HIGHLIGHT_FETCH_DEBOUNCE,
+    extraParams: computed(() => {
+      const stateMarkers = get(toggles, 'stateMarkers');
+      return {
+        excludeIgnoredAssets: !get(toggles, 'showIgnoredAssets'),
+        groupIdentifiers: get(groupIdentifiersFromQuery),
+        ...(stateMarkers.length > 0 ? { stateMarkers } : {}),
+      };
+    }),
     filterSchema: () => useHistoryEventFilter({
       eventSubtypes: (get(eventSubTypes) || []).length > 0,
       eventTypes: (get(eventTypes) || []).length > 0,
@@ -167,21 +192,46 @@ export function useHistoryEventsFilters(
         set(locationLabels, []);
       else
         set(locationLabels, locationLabelsParsed);
+
+      const stateMarkersParam = query.stateMarkers;
+      set(toggles, {
+        ...get(toggles),
+        stateMarkers: stateMarkersParam && typeof stateMarkersParam === 'string'
+          ? stateMarkersParam.split(',').filter(isValidHistoryEventState)
+          : [],
+      });
     },
     persistFilter: computed(() => ({
       enabled: true,
-      excludeKeys: ['identifiers', 'groupIdentifiers', 'duplicateHandlingStatus'],
+      excludeKeys: [
+        'missingAcquisitionIdentifier',
+        'groupIdentifiers',
+        'duplicateHandlingStatus',
+        'targetGroupIdentifier',
+        'highlightedAssetMovement',
+        'highlightedPotentialMatch',
+        'highlightedNegativeBalanceEvent',
+      ],
       tableId: TableId.HISTORY,
       transientKeys: ['txRefs'],
     })),
+    // Query params that should be preserved in the URL but not used for API requests.
     queryParamsOnly: computed(() => {
       const duplicateHandlingStatusValue = get(duplicateHandlingStatusFromQuery);
       const groupIdentifiersValue = get(groupIdentifiersFromQuery);
+      const { highlightedAssetMovement, highlightedPotentialMatch, highlightedNegativeBalanceEvent } = get(route).query;
 
+      const missingAcquisitionValue = get(missingAcquisitionFromQuery);
+      const stateMarkersValue = get(toggles, 'stateMarkers');
       return {
         duplicateHandlingStatus: duplicateHandlingStatusValue,
         groupIdentifiers: groupIdentifiersValue?.join(','),
+        highlightedAssetMovement,
+        highlightedNegativeBalanceEvent,
+        highlightedPotentialMatch,
         locationLabels: get(usedLocationLabels),
+        missingAcquisitionIdentifier: missingAcquisitionValue?.join(','),
+        ...(stateMarkersValue.length > 0 ? { stateMarkers: stateMarkersValue.join(',') } : {}),
       };
     }),
     requestParams: computed<Partial<HistoryEventRequestPayload>>(() => {
@@ -190,12 +240,13 @@ export function useHistoryEventsFilters(
         counterparties: get(protocols),
         eventSubtypes: get(eventSubTypes),
         eventTypes: get(eventTypes),
+        identifiers: get(missingAcquisitionFromQuery),
       };
 
       const accountsValue = get(usedLocationLabels);
 
-      if (isDefined(locationOverview))
-        params.location = toSnakeCase(get(locationOverview));
+      if (isDefined(location))
+        params.location = toSnakeCase(get(location));
 
       if (accountsValue.length > 0)
         params.locationLabels = get(usedLocationLabels);
@@ -228,9 +279,31 @@ export function useHistoryEventsFilters(
   });
 
   const highlightedIdentifiers = computed<string[] | undefined>(() => {
-    const { highlightedIdentifier, negativeBalanceEvent } = get(route).query;
-    const identifier = highlightedIdentifier ?? negativeBalanceEvent;
-    return identifier ? [identifier as string] : undefined;
+    const { highlightedAssetMovement, highlightedPotentialMatch, highlightedNegativeBalanceEvent } = get(route).query;
+    const identifiers: string[] = [];
+
+    if (highlightedAssetMovement)
+      identifiers.push(highlightedAssetMovement.toString());
+    if (highlightedPotentialMatch)
+      identifiers.push(highlightedPotentialMatch.toString());
+    if (highlightedNegativeBalanceEvent)
+      identifiers.push(highlightedNegativeBalanceEvent.toString());
+
+    return identifiers.length > 0 ? identifiers : undefined;
+  });
+
+  const highlightTypes = computed<Record<string, HighlightType>>(() => {
+    const { highlightedAssetMovement, highlightedPotentialMatch, highlightedNegativeBalanceEvent } = get(route).query;
+    const types: Record<string, HighlightType> = {};
+
+    if (highlightedAssetMovement)
+      types[highlightedAssetMovement.toString()] = 'warning';
+    if (highlightedNegativeBalanceEvent)
+      types[highlightedNegativeBalanceEvent.toString()] = 'error';
+    if (highlightedPotentialMatch)
+      types[highlightedPotentialMatch.toString()] = 'success';
+
+    return types;
   });
 
   const includes = computed<{ evmEvents: boolean; onlineEvents: boolean }>(() => {
@@ -241,42 +314,75 @@ export function useHistoryEventsFilters(
     };
   });
 
+  const hasActiveFiltersRaw = computed<boolean>(() =>
+    Object.keys(get(filters)).length > 0
+    || get(locationLabels).length > 0
+    || !isEqual(get(toggles), getDefaultToggles()));
+
+  const hasActiveFilters = useRefWithDebounce(hasActiveFiltersRaw, 500);
+
+  function clearFilters(): void {
+    updateFilter({});
+    onLocationLabelsChanged([]);
+    set(toggles, { ...getDefaultToggles() });
+  }
+
   function onLocationLabelsChanged(labels: string[]): void {
     set(userAction, true);
     set(locationLabels, labels);
   }
 
-  watchDebounced([filters, locationLabels], ([filters, locationLabels], [oldFilters, oldLocationLabels]) => {
-    const filterChanged = !isEqual(filters, oldFilters);
-    const accountsChanged = !isEqual(locationLabels, oldLocationLabels);
+  /**
+   * Calculate position of highlighted event within current filters and set the page directly.
+   * This avoids a duplicate fetch by setting the page before the pagination system's debounced fetch fires.
+   * The filter watcher fires at HIGHLIGHT_FILTER_DEBOUNCE while the pagination fetch fires at HIGHLIGHT_FETCH_DEBOUNCE,
+   * so if the position API responds quickly, setPage() resets the debounce and only one fetch occurs.
+   */
+  let navigationGeneration = 0;
 
-    if (!(filterChanged || accountsChanged))
+  async function navigateToHighlightPosition(): Promise<void> {
+    const generation = ++navigationGeneration;
+    const page = await findHighlightPage(get(pageParams), get(pagination).limit);
+
+    if (generation !== navigationGeneration)
       return;
 
-    // Update locationOverview when filter location changes
-    if (filterChanged)
-      set(locationOverview, filters.location);
+    if (page >= 1)
+      setPage(page);
+  }
 
-    // When accounts change, trigger a filter update to force re-fetch with new location labels
-    // The setPage(1) is handled by usePaginationFilters watch on [filters, extraParams]
-    if (accountsChanged && get(usedLocationLabels).length > 0) {
-      const updatedFilter = { ...get(filters) };
-      updateFilter(updatedFilter);
-    }
-  }, { debounce: 100 });
+  /**
+   * Re-navigate highlights when any parameter affecting the result set changes.
+   * Watches the aggregated pageParams (filters, toggles, limit, etc.) but ignores
+   * offset changes since those are just page navigation.
+   */
+  watchDebounced(pageParams, (params, oldParams) => {
+    if (!oldParams)
+      return;
+
+    const current = objectOmit(params, ['offset']);
+    const previous = objectOmit(oldParams, ['offset']);
+
+    if (isEqual(current, previous))
+      return;
+
+    startPromise(navigateToHighlightPosition());
+  }, { debounce: HIGHLIGHT_FILTER_DEBOUNCE, deep: true });
 
   return {
+    clearFilters,
     duplicateHandlingStatus: duplicateHandlingStatusFromQuery,
     fetchData,
     filters,
     groupIdentifiers: groupIdentifiersFromQuery,
     groupLoading,
     groups,
+    hasActiveFilters,
     highlightedIdentifiers,
-    identifiers: identifiersFromQuery,
+    highlightTypes,
+    identifiers: missingAcquisitionFromQuery,
     includes,
     locationLabels,
-    locationOverview,
     locations,
     matchers,
     onLocationLabelsChanged,

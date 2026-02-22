@@ -36,7 +36,7 @@ function confirmRefresh() {
           :disabled="processing"
           variant="outlined"
           color="primary"
-          class="rounded-r-none !outline-none border-r border-rui-primary/[0.5] disabled:!border-rui-text-disabled"
+          class="rounded-r-none !outline-none border-r border-rui-primary/[0.5] disabled:!border-rui-text-disabled [&>span]:!hidden lg:[&>span]:!inline"
           @click="confirmRefresh()"
         >
           <template #prepend>

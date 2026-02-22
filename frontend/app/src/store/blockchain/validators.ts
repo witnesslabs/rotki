@@ -1,13 +1,11 @@
 import type { MaybeRef } from 'vue';
 import type {
-  BlockchainAccount,
   EthereumValidator,
   EthereumValidatorRequestPayload,
-  ValidatorData,
 } from '@/types/blockchain/accounts';
 import type { BlockchainAssetBalances } from '@/types/blockchain/balances';
 import type { Collection } from '@/types/collection';
-import { assert, type Balance, type BigNumber, bigNumberify, Blockchain, type EthValidatorFilter, Zero } from '@rotki/common';
+import { type Balance, type BigNumber, bigNumberify, Blockchain, Eth2Validators, type EthValidatorFilter, Zero } from '@rotki/common';
 import { useBlockchainAccountsApi } from '@/composables/api/blockchain/accounts';
 import { useSupportedChains } from '@/composables/info/chains';
 import { usePremium } from '@/composables/premium';
@@ -16,8 +14,11 @@ import { useBalancesStore } from '@/modules/balances/use-balances-store';
 import { useBlockchainBalances } from '@/modules/balances/use-blockchain-balances';
 import { useNotificationsStore } from '@/store/notifications';
 import { useGeneralSettingsStore } from '@/store/settings/general';
+import { useTaskStore } from '@/store/tasks';
 import { Module } from '@/types/modules';
+import { TaskType } from '@/types/task-type';
 import { createValidatorAccount } from '@/utils/blockchain/accounts/create';
+import { isValidatorAccount } from '@/utils/blockchain/accounts/utils';
 import { sortAndFilterValidators } from '@/utils/blockchain/accounts/validator';
 import { logger } from '@/utils/logging';
 
@@ -48,8 +49,7 @@ export const useBlockchainValidatorsStore = defineStore('blockchain/validators',
     const accountBalances = get(balances)[Blockchain.ETH2] ?? [];
 
     const validators: EthereumValidator[] = [];
-    for (const account of accountData) {
-      assert(account.data.type === 'validator');
+    for (const account of accountData.filter(isValidatorAccount)) {
       const accountBalance: Balance = accountBalances[account.data.publicKey]?.assets?.ETH2?.address ?? {
         amount: Zero,
         value: Zero,
@@ -74,12 +74,18 @@ export const useBlockchainValidatorsStore = defineStore('blockchain/validators',
     },
   );
 
+  const { awaitTask } = useTaskStore();
+
   const fetchEthStakingValidators = async (payload?: EthValidatorFilter): Promise<void> => {
     if (!isEth2Enabled())
       return;
 
     try {
-      const validators = await getEth2Validators(payload);
+      const { taskId } = await getEth2Validators(payload);
+      const { result } = await awaitTask<Eth2Validators, { title: string }>(taskId, TaskType.FETCH_ETH2_VALIDATORS, {
+        title: t('actions.get_accounts.task.title', { blockchain: Blockchain.ETH2 }),
+      });
+      const validators = Eth2Validators.parse(result);
       updateAccounts(
         Blockchain.ETH2,
         validators.entries.map(validator =>
@@ -125,8 +131,7 @@ export const useBlockchainValidatorsStore = defineStore('blockchain/validators',
    * @param newOwnershipPercentage the ownership percentage of the validator after the edit
    */
   const updateEthStakingOwnership = (publicKey: string, newOwnershipPercentage: BigNumber): void => {
-    const isValidator = (x: BlockchainAccount): x is BlockchainAccount<ValidatorData> => x.data.type === 'validator';
-    const validators = [...get(accounts)[Blockchain.ETH2]?.filter(isValidator) ?? []];
+    const validators = [...get(accounts)[Blockchain.ETH2]?.filter(isValidatorAccount) ?? []];
     const validatorIndex = validators.findIndex(validator => validator.data.publicKey === publicKey);
     const [validator] = validators.splice(validatorIndex, 1);
     const oldOwnershipPercentage = bigNumberify(validator.data.ownershipPercentage || 100);

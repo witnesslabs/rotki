@@ -16,7 +16,7 @@ beforeAll(() => {
 
   vi.mock('@/composables/api/assets/info', () => ({
     useAssetInfoApi: vi.fn().mockReturnValue({
-      assetMapping: vi.fn().mockResolvedValue({}),
+      assetMapping: vi.fn().mockResolvedValue({ assets: {}, assetCollections: {} }),
     }),
   }));
 
@@ -84,6 +84,27 @@ beforeAll(() => {
     }),
     createI18n: () => ({}),
   }));
+
+  vi.mock('vue-router', () => {
+    const route = ref({
+      query: {},
+    });
+
+    return {
+      useRoute: vi.fn().mockReturnValue(route),
+      useRouter: vi.fn().mockImplementation(() => ({
+        currentRoute: route,
+        push: vi.fn(({ query }) => {
+          set(route, { ...get(route), query });
+          return true;
+        }),
+      })),
+      createRouter: vi.fn().mockImplementation(() => ({
+        beforeEach: vi.fn(),
+      })),
+      createWebHashHistory: vi.fn(),
+    };
+  });
 
   vi.mock('@/store/websocket', () => ({
     useWebsocketStore: () => ({

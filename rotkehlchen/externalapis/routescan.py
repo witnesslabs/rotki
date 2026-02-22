@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import gevent
 from requests import Response
@@ -31,9 +31,9 @@ log = RotkehlchenLogsAdapter(logger)
 # follows: `Result window is too large, PageNo x Offset size must be less than or equal to 10000`
 ROUTESCAN_PAGINATION_LIMIT: Final = 10000
 ROUTESCAN_BASE_URL: Final = 'https://api.routescan.io/v2/network/mainnet/evm/{chain_id}/etherscan/api'
-# Arbitrum One is also supported, but currently (2025-11-28) has a status of `Indexing in progress`
-# so may have some missing data. See https://docs.routescan.io/indexing-status
-ROUTESCAN_SUPPORTED_CHAINS: Final = (ChainID.ETHEREUM, ChainID.OPTIMISM, ChainID.BASE)
+# Arbitrum One and Base are also partially supported, but currently (2026-02-13) have a status
+# of `Not fully indexed` so may be missing data. See https://docs.routescan.io/indexing-status
+ROUTESCAN_SUPPORTED_CHAINS: Final = (ChainID.ETHEREUM, ChainID.OPTIMISM)
 
 
 class Routescan(ExternalServiceWithApiKey, EtherscanLikeApi):
@@ -76,6 +76,18 @@ class Routescan(ExternalServiceWithApiKey, EtherscanLikeApi):
     ) -> dict[str, str]:
         """Routescan doesn't need chainid in params since it's in the URL."""
         return {'module': module, 'action': action, 'apikey': api_key}
+
+    def _get_account_pagination_options(
+            self,
+            action: str,
+            options: dict[str, Any],
+    ) -> dict[str, str] | None:
+        """RouteScan defaults to small pages if page/offset are omitted."""
+        if action == 'txlistinternal' and 'txhash' in options:
+            return {'page': '1', 'offset': '100'}
+        if action in {'txlist', 'txlistinternal', 'tokentx'}:
+            return {'page': '1', 'offset': str(self.pagination_limit)}
+        return None
 
     def _handle_rate_limit(
             self,

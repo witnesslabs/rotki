@@ -1,7 +1,8 @@
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Final, Literal
 
 from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.utils.mixins.enums import DBIntEnumMixIn
 
 KDF_ITER: Final = 64000
 
@@ -21,15 +22,15 @@ TX_SPAM: Final = 1
 HISTORY_MAPPING_KEY_STATE: Final = 'state'
 
 
-class HistoryMappingState(IntEnum):
+class HistoryMappingState(DBIntEnumMixIn):
     CUSTOMIZED = 1
     PROFIT_ADJUSTMENT = 2  # events auto-created during historical balances processing when withdrawals exceed deposits  # noqa: E501
-    AUTO_MATCHED = 3  # events matched with asset movements, and fees created during matching.
+    MATCHED = 3  # events matched with asset movements and adjustments created during matching.
     IMPORTED_FROM_CSV = 4
 
-    def serialize_for_api(self) -> str:
-        """Serializes the mapping state for the API"""
-        return self.name.lower()
+
+class HistoryEventLinkType(DBIntEnumMixIn):
+    ASSET_MOVEMENT_MATCH = 1
 
 
 EVM_ACCOUNTS_DETAILS_LAST_QUERIED_TS: Final = 'last_queried_timestamp'
@@ -88,9 +89,11 @@ HISTORY_BASE_ENTRY_LENGTH: Final = 13
 GROUP_HAS_IGNORED_ASSETS_FIELD: Final = 'MAX(ignored) OVER (PARTITION BY group_identifier) AS group_has_ignored_assets'  # noqa: E501
 
 CHAIN_EVENT_FIELDS: Final = 'tx_ref, counterparty, address'
+CHAIN_EVENT_NULL_FIELDS: Final = 'NULL as tx_ref, NULL as counterparty, NULL as address'
 CHAIN_FIELD_LENGTH: Final = 3
 
 ETH_STAKING_EVENT_FIELDS: Final = 'validator_index, is_exit_or_blocknumber'
+ETH_STAKING_EVENT_NULL_FIELDS: Final = 'NULL as validator_index, NULL as is_exit_or_blocknumber'
 ETH_STAKING_FIELD_LENGTH: Final = 2
 
 EXTRAINTERNALTXPREFIX: Final = 'extrainternaltx'

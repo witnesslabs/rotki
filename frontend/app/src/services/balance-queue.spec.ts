@@ -1,3 +1,4 @@
+import { wait } from '@shared/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { BalanceQueueService, type QueueItem, type QueueItemMetadata } from '@/services/balance-queue';
 import { TaskType } from '@/types/task-type';
@@ -69,7 +70,7 @@ describe('balanceQueueService', () => {
       const executionOrder: string[] = [];
       const createExecuteFn = (id: string): (() => Promise<void>) => vi.fn(async () => {
         executionOrder.push(`start-${id}`);
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await wait(50);
         executionOrder.push(`end-${id}`);
       });
 
@@ -98,7 +99,7 @@ describe('balanceQueueService', () => {
       const promises = items.map(async item => queue.enqueue(item));
 
       // Wait a bit to check concurrency
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await wait(10);
       expect(queue.getStats().running).toBeLessThanOrEqual(2);
 
       // Wait for all to complete
@@ -184,7 +185,7 @@ describe('balanceQueueService', () => {
     it('should clear queue', async () => {
       const executeFns = new Array(5).fill(null).map(() =>
         vi.fn(async () => {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await wait(100);
         }),
       );
 
@@ -197,11 +198,11 @@ describe('balanceQueueService', () => {
 
       const batchPromise = queue.enqueueBatch(items);
 
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await wait(10);
 
       queue.clear();
 
-      await expect(batchPromise).rejects.toThrow('Queue cleared');
+      await expect(batchPromise).resolves.toBeUndefined();
 
       expect(queue.getStats()).toMatchObject({
         pending: 0,
@@ -277,7 +278,7 @@ describe('balanceQueueService', () => {
       const enqueuePromise = queue.enqueue(item);
 
       // Wait a bit to ensure the item is running
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await wait(10);
       expect(queue.isProcessing()).toBe(true);
 
       // Resolve the wait promise to complete the item
@@ -287,7 +288,7 @@ describe('balanceQueueService', () => {
       await enqueuePromise;
 
       // Small delay to ensure cleanup
-      await new Promise(resolve => setTimeout(resolve, 10));
+      await wait(10);
       expect(queue.isProcessing()).toBe(false);
     });
   });
@@ -350,7 +351,7 @@ describe('balanceQueueService', () => {
       const enqueuePromise = queue.enqueue(item);
 
       // Wait a bit to ensure processing attempt was made
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await wait(50);
 
       // Item should be pending, not executed
       expect(executeFn).not.toHaveBeenCalled();
@@ -420,7 +421,7 @@ describe('balanceQueueService', () => {
       // Enqueue while "decoding" is true (canProcess returns false)
       const enqueuePromise = queue.enqueue(item);
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await wait(50);
       expect(executeFn).not.toHaveBeenCalled();
 
       // Simulate decoding finished
@@ -441,7 +442,7 @@ describe('balanceQueueService', () => {
         executionOrder.push(`start-${id}`);
         // First item takes time, during which we'll block
         if (id === '1') {
-          await new Promise(resolve => setTimeout(resolve, 50));
+          await wait(50);
           canProcess = false; // Block after first item starts
         }
         executionOrder.push(`end-${id}`);
@@ -471,7 +472,7 @@ describe('balanceQueueService', () => {
       const batchPromise = queue.enqueueBatch(items);
 
       // Wait for first two items to start (concurrency is 2)
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await wait(100);
 
       // Third item should be blocked
       const stats = queue.getStats();
@@ -551,6 +552,46 @@ describe('balanceQueueService', () => {
       const instance2 = BalanceQueueService.getInstance<TestMetadata>();
 
       expect(instance1).not.toBe(instance2);
+    });
+
+    it('should have clean state on new instance after reset', async () => {
+      const instance1 = BalanceQueueService.getInstance<TestMetadata>();
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      // Process items including a failure to populate completedItems and failedItems
+      const items: QueueItem<TestMetadata>[] = [
+        {
+          executeFn: vi.fn().mockResolvedValue(undefined),
+          id: 'test-1',
+          metadata: { chain: 'eth' },
+          type: TaskType.QUERY_BLOCKCHAIN_BALANCES,
+        },
+        {
+          executeFn: vi.fn().mockRejectedValue(new Error('fail')),
+          id: 'test-2',
+          metadata: { chain: 'btc' },
+          type: TaskType.QUERY_BLOCKCHAIN_BALANCES,
+        },
+      ];
+
+      await instance1.enqueueBatch(items);
+      expect(instance1.getStats().completed).toBe(1);
+      expect(instance1.getStats().failed).toBe(1);
+
+      BalanceQueueService.resetInstance();
+      const instance2 = BalanceQueueService.getInstance<TestMetadata>();
+
+      // New instance should have completely clean state
+      expect(instance2.getStats()).toEqual({
+        completed: 0,
+        failed: 0,
+        pending: 0,
+        running: 0,
+        total: 0,
+      });
+      expect(instance2.getAllItems()).toHaveLength(0);
+
+      consoleError.mockRestore();
     });
   });
 

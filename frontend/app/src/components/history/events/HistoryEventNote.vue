@@ -62,7 +62,8 @@ function isLinkTypeWithoutImage(t: any, chain: string): t is keyof ExplorerUrls 
 <template>
   <div
     v-bind="$attrs"
-    class="inline"
+    data-cy="event-notes"
+    class="notes-content text-sm text-rui-text-secondary leading-relaxed"
   >
     <template
       v-for="(note, index) in formattedNotes"
@@ -93,6 +94,7 @@ function isLinkTypeWithoutImage(t: any, chain: string): t is keyof ExplorerUrls 
         :text="note.address"
         :type="note.type"
         :location="note.chain ?? chain"
+        :display-mode="note.showCopyOnly ? 'copy' : 'default'"
       />
       <template v-else-if="note.type === NoteType.AMOUNT">
         <AssetAmountDisplay
@@ -114,6 +116,7 @@ function isLinkTypeWithoutImage(t: any, chain: string): t is keyof ExplorerUrls 
         v-else-if="note.type === NoteType.URL && note.url"
         :key="`${index}-link`"
         :url="note.url"
+        :title="note.url"
         class="text-wrap hover:underline"
         :text="note.word"
         color="primary"

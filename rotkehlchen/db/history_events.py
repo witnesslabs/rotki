@@ -3,33 +3,38 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Optional, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Literal, Optional, TypeAlias, cast, overload
 
-from pysqlcipher3 import dbapi2 as sqlcipher
 from solders.solders import Signature
+from sqlcipher3 import dbapi2 as sqlcipher
 
+from rotkehlchen.api.v1.types import IncludeExcludeFilterData
 from rotkehlchen.api.websockets.typedefs import ProgressUpdateSubType, WSMessageType
 from rotkehlchen.assets.asset import Asset
 from rotkehlchen.chain.bitcoin.bch.constants import BCH_GROUP_IDENTIFIER_PREFIX
 from rotkehlchen.chain.bitcoin.btc.constants import BTC_GROUP_IDENTIFIER_PREFIX
 from rotkehlchen.chain.evm.types import string_to_evm_address
 from rotkehlchen.constants import ZERO
-from rotkehlchen.db.cache import ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE, DBCacheDynamic, DBCacheStatic
+from rotkehlchen.db.cache import IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX, DBCacheDynamic
 from rotkehlchen.db.constants import (
     CHAIN_EVENT_FIELDS,
+    CHAIN_EVENT_NULL_FIELDS,
     CHAIN_FIELD_LENGTH,
     ETH_STAKING_EVENT_FIELDS,
+    ETH_STAKING_EVENT_NULL_FIELDS,
     ETH_STAKING_FIELD_LENGTH,
     GROUP_HAS_IGNORED_ASSETS_FIELD,
     HISTORY_BASE_ENTRY_FIELDS,
     HISTORY_BASE_ENTRY_LENGTH,
     HISTORY_MAPPING_KEY_STATE,
     TX_DECODED,
+    HistoryEventLinkType,
     HistoryMappingState,
 )
 from rotkehlchen.db.filtering import (
     ALL_EVENTS_DATA_JOIN,
     EVENTS_WITH_COUNTERPARTY_JOIN,
+    DBMultiIntegerFilter,
     EthDepositEventFilterQuery,
     EthWithdrawalFilterQuery,
     EvmEventFilterQuery,
@@ -39,11 +44,13 @@ from rotkehlchen.db.filtering import (
     HistoryEventWithTxRefFilterQuery,
     SolanaEventFilterQuery,
 )
+from rotkehlchen.db.utils import get_query_chunks
 from rotkehlchen.errors.asset import UnknownAsset
 from rotkehlchen.errors.misc import InputError
 from rotkehlchen.errors.serialization import DeserializationError
 from rotkehlchen.exchanges.constants import ALL_SUPPORTED_EXCHANGES
 from rotkehlchen.fval import FVal
+from rotkehlchen.history.events.constants import CHAIN_ENTRY_TYPES, STAKING_ENTRY_TYPES
 from rotkehlchen.history.events.structures.asset_movement import AssetMovement
 from rotkehlchen.history.events.structures.base import (
     HistoryBaseEntry,
@@ -61,7 +68,7 @@ from rotkehlchen.history.events.structures.onchain_event import OnchainEvent
 from rotkehlchen.history.events.structures.solana_event import SolanaEvent
 from rotkehlchen.history.events.structures.solana_swap import SolanaSwapEvent
 from rotkehlchen.history.events.structures.swap import SwapEvent
-from rotkehlchen.history.events.structures.types import HistoryEventSubType
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
 from rotkehlchen.history.price import query_price_or_use_default
 from rotkehlchen.logging import RotkehlchenLogsAdapter
 from rotkehlchen.serialization.deserialize import deserialize_fval
@@ -77,7 +84,7 @@ from rotkehlchen.types import (
     Timestamp,
     TimestampMS,
 )
-from rotkehlchen.utils.misc import ts_ms_to_sec, ts_now_in_ms, ts_sec_to_ms
+from rotkehlchen.utils.misc import ts_ms_to_sec, ts_sec_to_ms
 
 if TYPE_CHECKING:
     from rotkehlchen.db.dbhandler import DBHandler
@@ -85,6 +92,54 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 log = RotkehlchenLogsAdapter(logger)
+
+
+def _build_matched_movement_exclusion(
+        filter_query: 'HistoryBaseEntryFilterQuery',
+) -> tuple[str, list[Any]]:
+    """Exclude the non-movement side of matched pairs from aggregated pagination.
+
+    Matched pairs have two distinct group_identifiers that would each take a pagination
+    slot, causing duplicates across pages. This hides the non-movement side (or the
+    larger-ID side for movement-to-movement matches) only when the movement side exists
+    in the filtered results. If it doesn't, the matched side remains visible.
+
+    Returns a tuple of the SQL fragment and its bindings.
+    """
+    link_type_value = HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()
+    exclusion_core = (
+        'group_identifier NOT IN ('
+        'SELECT he_match.group_identifier FROM history_event_links hel '
+        'JOIN history_events he_match ON he_match.identifier = hel.right_event_id '
+        'JOIN history_events he_move ON he_move.identifier = hel.left_event_id '
+        'WHERE hel.link_type = ? '
+        'AND (he_move.entry_type != he_match.entry_type '
+        'OR hel.left_event_id < hel.right_event_id)'
+    )
+    base_filters, base_bindings = filter_query.prepare(
+        with_pagination=False,
+        with_order=False,
+        with_group_by=False,
+        without_ignored_asset_filter=True,
+    )
+    if not base_filters:
+        # Unfiltered: every movement is visible, so always exclude the non-movement side.
+        # No need for the expensive IN check against all group_identifiers.
+        return f'{exclusion_core})', [link_type_value]
+
+    # Filtered: only exclude when the movement side exists in the filtered results.
+    # Wrap in a subquery so that column aliases (e.g. history_events_identifier)
+    # defined in get_columns() are available for the filter predicates.
+    movement_check = (
+        f'SELECT DISTINCT group_identifier '
+        f'FROM (SELECT {filter_query.get_columns()} {filter_query.get_join_query()}) '
+        f'{base_filters}'
+    )
+    return (
+        f'{exclusion_core} AND he_move.group_identifier IN ({movement_check}))',
+        [link_type_value] + base_bindings,
+    )
+
 
 HistoryEventsReturnType: TypeAlias = list[HistoryBaseEntry] | list[tuple[int, HistoryBaseEntry]]
 
@@ -112,16 +167,7 @@ class DBHistoryEvents:
             timestamp: TimestampMS,
     ) -> None:
         """Track earliest modified event timestamp and when modification occurred."""
-        write_cursor.execute(
-            'INSERT INTO key_value_cache (name, value) VALUES (?, ?) '
-            'ON CONFLICT(name) DO UPDATE SET value = '
-            'MIN(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))',
-            (DBCacheStatic.STALE_BALANCES_FROM_TS.value, str(timestamp)),
-        )
-        write_cursor.execute(
-            'INSERT OR REPLACE INTO key_value_cache (name, value) VALUES (?, ?)',
-            (DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value, str(ts_now_in_ms())),
-        )
+        # Historical balances processing is temporarily disabled.
 
     def _execute_and_track_modified(
             self,
@@ -137,8 +183,7 @@ class DBHistoryEvents:
             if min_ts is None or ts < min_ts:
                 min_ts = ts
 
-        if count > 0:
-            self._mark_events_modified(write_cursor=write_cursor, timestamp=TimestampMS(min_ts))  # type: ignore
+        # TODO (balances): add _mark_events_modified for min_ts if count > 0
         return count
 
     def delete_events_and_track(
@@ -152,18 +197,24 @@ class DBHistoryEvents:
 
         Returns the number of rows deleted.
         """
-        deleted_ids, timestamps = [], []
+        deleted_ids, timestamps, group_ids = [], [], set()
         if len(rows := write_cursor.execute(
-            f'DELETE FROM history_events {where_clause} RETURNING timestamp, identifier',
+            f'DELETE FROM history_events {where_clause} RETURNING timestamp, identifier, group_identifier',  # noqa: E501
             where_bindings,
         ).fetchall()) > 0:
             for row in rows:
                 timestamps.append((row[0],))
                 deleted_ids.append(str(row[1]))
+                group_ids.add(row[2])
             write_cursor.execute(
                 "DELETE FROM key_value_cache WHERE name LIKE 'customized_event_original_%' "
                 f"AND value IN ({','.join('?' * len(deleted_ids))})",
                 deleted_ids,
+            )
+            write_cursor.execute(
+                f"DELETE FROM key_value_cache WHERE name LIKE '{IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX}%' "  # noqa: E501
+                f"AND value IN ({','.join('?' * len(group_ids))})",
+                list(group_ids),
             )
         return self._execute_and_track_modified(
             write_cursor=write_cursor,
@@ -233,11 +284,10 @@ class DBHistoryEvents:
             write_cursor.executemany(
                 'INSERT OR IGNORE INTO history_events_mappings(parent_identifier, name, value) '
                 'VALUES(?, ?, ?)',
-                [(identifier, k, v) for k, v in mapping_values.items()],
+                [(identifier, k, v.serialize_for_db()) for k, v in mapping_values.items()],
             )
 
-        if not skip_tracking:
-            self._mark_events_modified(write_cursor=write_cursor, timestamp=event.timestamp)
+        # TODO (balances): add _mark_events_modified for event.timestamp if not skip_tracking
         return identifier
 
     def add_history_events(
@@ -273,19 +323,132 @@ class DBHistoryEvents:
                 min_timestamp = event.timestamp
 
         # Call tracking ONCE for the entire batch with minimum timestamp
-        if min_timestamp is not None:
-            self._mark_events_modified(write_cursor=write_cursor, timestamp=min_timestamp)
+        # TODO (balances): add _mark_events_modified for min_timestamp if min_timestamp is not None
+
+    @staticmethod
+    def save_history_event_backup(
+            write_cursor: 'DBCursor',
+            identifier: int | None,
+    ) -> None:
+        """Create a backup copy of an event before modifying it so it can be restored to its
+        original state later. Use insert or ignore so we keep the earliest original version if
+        multiple edits happen.
+        """
+        if write_cursor.execute(
+            'INSERT OR IGNORE INTO history_events_backup '
+            'SELECT * FROM history_events WHERE identifier=?',
+            (identifier,),
+        ).rowcount == 0:
+            return  # A backup already exists for this event
+
+        write_cursor.execute(
+            'INSERT INTO chain_events_info_backup '
+            'SELECT * FROM chain_events_info WHERE identifier=?',
+            (identifier,),
+        )
+
+    @staticmethod
+    def maybe_restore_history_events_from_backup(
+            write_cursor: 'DBCursor',
+            identifiers: list[int],
+    ) -> None:
+        """Restore multiple history events to their original backed-up state in bulk.
+        Events without a backup are silently skipped.
+        """
+        for chunk, placeholders in get_query_chunks(identifiers):
+            for table in ('history_events', 'chain_events_info'):
+                write_cursor.execute(
+                    f'INSERT OR REPLACE INTO {table} '
+                    f'SELECT * FROM {table}_backup WHERE identifier IN ({placeholders})',
+                    chunk,
+                )
+            # Delete backup entries (also deletes backup chain info via foreign key)
+            write_cursor.execute(
+                f'DELETE FROM history_events_backup WHERE identifier IN ({placeholders})',
+                chunk,
+            )
+
+    def restore_matched_events_before_purge(
+            self,
+            write_cursor: 'DBCursor',
+            location: Location,
+    ) -> None:
+        """Undo asset movement matching for events linked to the purged location.
+
+        Matched events on the other side still carry modified fields from the matching process.
+        This restores them from backup and removes any auto-created adjustment events.
+        """
+        link_type_db = HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db()
+        matched_db = HistoryMappingState.MATCHED.serialize_for_db()
+        location_db = location.serialize_for_db()
+        events_to_restore: set[int] = set()
+
+        # grab all matched pairs that touch this location, along with each side's location
+        # so we can figure out which side survives the purge and needs restoration
+        for left_id, right_id, left_loc, right_loc in write_cursor.execute(
+            'SELECT L.left_event_id, L.right_event_id, '
+            'HL.location, HR.location '
+            'FROM history_event_links L '
+            'INNER JOIN history_events HL ON HL.identifier = L.left_event_id '
+            'INNER JOIN history_events HR ON HR.identifier = L.right_event_id '
+            'WHERE L.link_type = ? AND (HL.location = ? OR HR.location = ?)',
+            (link_type_db, location_db, location_db),
+        ):
+            if left_loc == location_db and right_loc != location_db:
+                events_to_restore.add(right_id)
+            elif right_loc == location_db and left_loc != location_db:
+                events_to_restore.add(left_id)
+            # both sides belong to the purged location, nothing to restore
+
+        if len(events_to_restore) == 0:
+            return
+
+        # clean up any adjustment events that were auto-created during matching
+        # on the surviving side (adjustments in the purged location get deleted with the purge)
+        for chunk, placeholders in get_query_chunks(list(events_to_restore)):
+            self.delete_events_and_track(
+                write_cursor=write_cursor,
+                where_clause=(
+                    f'WHERE type = ? AND group_identifier IN '
+                    f'(SELECT group_identifier FROM history_events '
+                    f'WHERE identifier IN ({placeholders})) '
+                    f'AND identifier IN (SELECT parent_identifier FROM history_events_mappings '
+                    f'WHERE name = ? AND value = ?)'
+                ),
+                where_bindings=(
+                    HistoryEventType.EXCHANGE_ADJUSTMENT.serialize(),
+                    *chunk,
+                    HISTORY_MAPPING_KEY_STATE,
+                    matched_db,
+                ),
+            )
+
+        # put each surviving event back to its pre-match state
+        self.maybe_restore_history_events_from_backup(
+            write_cursor=write_cursor,
+            identifiers=list(events_to_restore),
+        )
+
+        # and drop their MATCHED mappings in one go
+        for chunk, placeholders in get_query_chunks(list(events_to_restore)):
+            write_cursor.execute(
+                f'DELETE FROM history_events_mappings '
+                f'WHERE parent_identifier IN ({placeholders}) '
+                f'AND name = ? AND value = ?',
+                (*chunk, HISTORY_MAPPING_KEY_STATE, matched_db),
+            )
 
     def edit_history_event(
             self,
             write_cursor: 'DBCursor',
             event: HistoryBaseEntry,
-            mapping_state: HistoryMappingState = HistoryMappingState.CUSTOMIZED,
+            mapping_state: HistoryMappingState | None,
+            save_backup: bool = False,
     ) -> None:
         """
         Edit a history entry to the DB with information provided by the user.
         NOTE: It edits all the fields except the extra_data one.
-        Marks the event with the specified mapping state.
+        Marks the event with the specified mapping state if provided.
         Only tracks modification for balance cache invalidation if balance-affecting
         fields change (timestamp, asset, amount, type, subtype, location_label).
 
@@ -297,6 +460,9 @@ class DBHistoryEvents:
             'FROM history_events WHERE identifier=?',
             (event.identifier,),
         ).fetchone()
+
+        if save_backup:
+            self.save_history_event_backup(write_cursor=write_cursor, identifier=event.identifier)
 
         for idx, (_, updatestr, bindings) in enumerate(event.serialize_for_db()):
             if idx == 0:  # base history event data
@@ -317,13 +483,13 @@ class DBHistoryEvents:
             else:  # all other data
                 write_cursor.execute(f'{updatestr} WHERE identifier=?', (*bindings, event.identifier))  # noqa: E501
 
-        # Mark as customized and store original position for duplicate prevention during redecode.
+        # Mark event state and store original position for duplicate prevention during redecode.
         # Only store original position on first customization (when INSERT succeeds).
-        if self.set_event_mapping_state(
+        if mapping_state is not None and self.set_event_mapping_state(
             write_cursor=write_cursor,
             event=event,
             mapping_state=mapping_state,
-        ) and isinstance(event, OnchainEvent):
+        ) and mapping_state == HistoryMappingState.CUSTOMIZED and isinstance(event, OnchainEvent):
             write_cursor.execute(
                 'INSERT INTO key_value_cache (name, value) VALUES (?, ?)',
                 (DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX.get_db_key(
@@ -343,10 +509,7 @@ class DBHistoryEvents:
         ):
             return
 
-        self._mark_events_modified(
-            write_cursor=write_cursor,
-            timestamp=TimestampMS(min(old_data[0], event.timestamp)),
-        )
+        # TODO (balances): add _mark_events_modified for min(old_data[0], event.timestamp)
 
     @staticmethod
     def set_event_mapping_state(
@@ -361,7 +524,7 @@ class DBHistoryEvents:
         write_cursor.execute(
             'INSERT OR IGNORE INTO history_events_mappings(parent_identifier, name, value) '
             'VALUES(?, ?, ?)',
-            (event.identifier, HISTORY_MAPPING_KEY_STATE, mapping_state),
+            (event.identifier, HISTORY_MAPPING_KEY_STATE, mapping_state.serialize_for_db()),
         )
         return write_cursor.rowcount == 1
 
@@ -479,17 +642,23 @@ class DBHistoryEvents:
             write_cursor: 'DBCursor',
             location: BLOCKCHAIN_LOCATIONS_TYPE,
             address: str | None,
+            customized_handling: Literal['preserve_events', 'preserve_transactions'] = 'preserve_events',  # noqa: E501
     ) -> None:
         """Delete all uncustomized history events for the given location and optionally address.
         For EVM and Solana, only deletes events that also have a corresponding tx in the DB.
         Also avoids deleting any events that are matched with asset movements.
+
+        customized_handling controls how customized/matched events affect deletion:
+        - 'preserve_events': only the individual customized/matched events are kept.
+        - 'preserve_transactions': all events in a transaction are kept when any event
+          in that transaction is customized or matched.
         """
         events_to_keep_num = write_cursor.execute(
             'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value IN (?, ?)',
             (customized_bindings := (
                 HISTORY_MAPPING_KEY_STATE,
-                HistoryMappingState.CUSTOMIZED,
-                HistoryMappingState.AUTO_MATCHED,
+                HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+                HistoryMappingState.MATCHED.serialize_for_db(),
             )),
         ).fetchone()[0]
         if location.is_bitcoin():
@@ -509,7 +678,15 @@ class DBHistoryEvents:
         bindings: tuple = (location.serialize_for_db(),)
         filter_conditions = ''
         if events_to_keep_num != 0:
-            filter_conditions += ' AND identifier NOT IN (SELECT parent_identifier FROM history_events_mappings WHERE name=? AND value IN (?, ?))'  # noqa: E501
+            if customized_handling == 'preserve_transactions':
+                filter_conditions += (
+                    ' AND group_identifier NOT IN ('
+                    'SELECT H2.group_identifier FROM history_events H2 '
+                    'INNER JOIN history_events_mappings M ON H2.identifier = M.parent_identifier '
+                    'WHERE M.name=? AND M.value IN (?, ?))'
+                )
+            else:
+                filter_conditions += ' AND identifier NOT IN (SELECT parent_identifier FROM history_events_mappings WHERE name=? AND value IN (?, ?))'  # noqa: E501
             bindings += customized_bindings
         if address is not None:
             filter_conditions += ' AND location_label = ?'
@@ -530,38 +707,76 @@ class DBHistoryEvents:
         Handles different cases depending on the location:
         * Bitcoin - simply deletes all non-customized bitcoin events.
         * EVM and EVM-like - deletes non-customized events that also have a corresponding
-          transaction in the evm_transactions table.
-        * EVM - removes the TX_DECODED evm_tx_mappings to enable re-processing.
+          transaction in the evm_transactions table. If any event in a transaction is
+          customized, all events in that transaction are preserved.
+        * EVM - removes the TX_DECODED evm_tx_mappings to enable re-processing,
+          except for transactions containing customized events.
         """
         self.delete_location_events(
             write_cursor=write_cursor,
             location=location,
             address=None,
+            customized_handling='preserve_transactions',
         )
 
         # zksynclite's decode status is stored in zksynclite_transactions.is_decoded
         # and btc/bch don't have the individual txs or decoded status in the db
         if location.is_evm():  # so only delete mappings here for evm and solana locations
-            write_cursor.execute(
-                'DELETE from evm_tx_mappings WHERE tx_id IN (SELECT identifier FROM evm_transactions) AND value=?',  # noqa: E501
-                (TX_DECODED,),
-            )
+            query = 'DELETE from evm_tx_mappings WHERE tx_id IN (SELECT identifier FROM evm_transactions) AND value=?'  # noqa: E501
+            bindings: tuple = (TX_DECODED,)
+            if (write_cursor.execute(
+                'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value IN (?, ?)',
+                (customized_bindings := (
+                    HISTORY_MAPPING_KEY_STATE,
+                    HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+                    HistoryMappingState.MATCHED.serialize_for_db(),
+                )),
+            ).fetchone()[0]) != 0:
+                query += (
+                    ' AND tx_id NOT IN ('
+                    'SELECT DISTINCT T.identifier FROM evm_transactions T '
+                    'INNER JOIN chain_events_info C ON T.tx_hash = C.tx_ref '
+                    'INNER JOIN history_events_mappings M ON C.identifier = M.parent_identifier '
+                    'WHERE M.name=? AND M.value IN (?, ?))'
+                )
+                bindings += customized_bindings
+            write_cursor.execute(query, bindings)
         elif location == Location.SOLANA:
-            write_cursor.execute(
-                'DELETE from solana_tx_mappings WHERE tx_id IN (SELECT identifier FROM solana_transactions) AND value=?',  # noqa: E501
-                (TX_DECODED,),
-            )
+            query = 'DELETE from solana_tx_mappings WHERE tx_id IN (SELECT identifier FROM solana_transactions) AND value=?'  # noqa: E501
+            bindings = (TX_DECODED,)
+            if (write_cursor.execute(
+                'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value IN (?, ?)',
+                (customized_bindings := (
+                    HISTORY_MAPPING_KEY_STATE,
+                    HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+                    HistoryMappingState.MATCHED.serialize_for_db(),
+                )),
+            ).fetchone()[0]) != 0:
+                query += (
+                    ' AND tx_id NOT IN ('
+                    'SELECT DISTINCT T.identifier FROM solana_transactions T '
+                    'INNER JOIN chain_events_info C ON T.signature = C.tx_ref '
+                    'INNER JOIN history_events_mappings M ON C.identifier = M.parent_identifier '
+                    'WHERE M.name=? AND M.value IN (?, ?))'
+                )
+                bindings += customized_bindings
+            write_cursor.execute(query, bindings)
 
     def delete_events_by_tx_ref(
             self,
             write_cursor: 'DBCursor',
             tx_refs: Sequence[EVMTxHash | BTCTxId | Signature],
             location: BLOCKCHAIN_LOCATIONS_TYPE,
-            delete_customized: bool = False,
+            customized_handling: Literal['delete', 'preserve_events', 'preserve_transactions'] = 'preserve_events',  # noqa: E501
     ) -> None:
-        """Delete all relevant (by transaction hash) history events except those that
-        are customized. If delete_customized is True then delete those too.
+        """Delete all relevant (by transaction hash) history events.
         Only use with limited number of transactions!!!
+
+        customized_handling controls how customized events affect deletion:
+        - 'delete': delete all events including customized ones.
+        - 'preserve_events': keep only individual customized events, delete siblings.
+        - 'preserve_transactions': keep all events in a transaction when any event
+          in that transaction is customized.
 
         If you want to reset all decoded events better use the _reset_decoded_events
         code in v37 -> v38 upgrade as that is not limited to the number of transactions
@@ -584,14 +799,21 @@ class DBHistoryEvents:
                 bindings = list(tx_refs)  # type: ignore  # different type of elements in the list
 
         if (
-            delete_customized is False and
+            customized_handling != 'delete' and
             (length := len(customized_event_ids := self.get_event_mapping_states(
                 cursor=write_cursor,
                 location=location,
                 mapping_state=HistoryMappingState.CUSTOMIZED,
             ))) != 0
         ):
-            where_str += f' AND identifier NOT IN ({", ".join(["?"] * length)})'
+            if customized_handling == 'preserve_transactions':
+                where_str += (
+                    ' AND group_identifier NOT IN ('
+                    'SELECT group_identifier FROM history_events WHERE identifier IN ('
+                    + ', '.join(['?'] * length) + '))'
+                )
+            else:  # preserve_events
+                where_str += f' AND identifier NOT IN ({", ".join(["?"] * length)})'
             bindings.extend(customized_event_ids)  # type: ignore  # different type of elements in the list
 
         self.delete_events_and_track(
@@ -631,7 +853,7 @@ class DBHistoryEvents:
         bindings: list[Any] = [HISTORY_MAPPING_KEY_STATE]
         if mapping_state is not None:
             where_str += 'AND A.value = ? '
-            bindings.append(mapping_state)
+            bindings.append(mapping_state.serialize_for_db())
 
         if location is None:
             cursor.execute(
@@ -680,23 +902,29 @@ class DBHistoryEvents:
             entries_limit: int | None,
             aggregate_by_group_ids: bool = False,
             match_exact_events: bool = True,
+            include_order: bool = True,
     ) -> tuple[str, list]:
         """Returns the sql queries and bindings for the history events without pagination."""
+        chain_fields, staking_fields, join_clause = DBHistoryEvents._build_events_query_parts(
+            filter_query=filter_query,
+        )
         # group_has_ignored_assets is added at the END so existing slicing logic is not affected.
         # It's computed via a window function to detect groups with ignored assets even when
         # those rows are filtered out by exclude_ignored_assets.
-        base_suffix = f'{HISTORY_BASE_ENTRY_FIELDS}, {CHAIN_EVENT_FIELDS}, {ETH_STAKING_EVENT_FIELDS}, {GROUP_HAS_IGNORED_ASSETS_FIELD} {ALL_EVENTS_DATA_JOIN}'  # noqa: E501
+        base_suffix = f'{HISTORY_BASE_ENTRY_FIELDS}, {chain_fields}, {staking_fields}, {GROUP_HAS_IGNORED_ASSETS_FIELD} {join_clause}'  # noqa: E501
         if aggregate_by_group_ids:
+            exclusion_sql, exclusion_bindings = _build_matched_movement_exclusion(filter_query)
             filters, query_bindings = filter_query.prepare(
                 with_group_by=True,
                 with_pagination=False,
-                with_order=match_exact_events is True,  # skip order when we want the whole group of events since we order in an outer part of the query later  # noqa: E501
+                with_order=match_exact_events is True and include_order is True,  # skip order when we want the whole group of events since we order in an outer part of the query later  # noqa: E501
                 without_ignored_asset_filter=True,
+                extra_conditions=[(exclusion_sql, exclusion_bindings)],
             )
             prefix = 'SELECT COUNT(*), *'
         else:
             filters, query_bindings = filter_query.prepare(
-                with_order=match_exact_events is True,  # same as above
+                with_order=match_exact_events is True and include_order is True,  # same as above
                 with_pagination=False,
             )
             prefix = 'SELECT *'
@@ -711,20 +939,132 @@ class DBHistoryEvents:
             ), [entries_limit]
 
         if match_exact_events is False:  # return all group events instead of just the filtered ones.  # noqa: E501
-            if filter_query.order_by is not None:
+            if include_order is True and filter_query.order_by is not None:
                 order_by = filter_query.order_by.prepare()
             else:
                 order_by = ''
 
+            # The inner GROUP BY query only needs group_identifier for filtering,
+            # not the full JOINs and window function that base_suffix provides.
+            # Use a lightweight query (like the count query) for the inner part.
+            if entries_limit is None:
+                inner_suffix = f'{filter_query.get_columns()} {filter_query.get_join_query()}'
+                inner_limit: list = []
+            else:
+                inner_suffix = (
+                    f'* FROM (SELECT {filter_query.get_columns()} {filter_query.get_join_query()}) '  # noqa: E501
+                    'WHERE group_identifier IN ('
+                    'SELECT DISTINCT group_identifier FROM history_events '
+                    'ORDER BY timestamp DESC, sequence_index ASC LIMIT ?)'
+                )
+                inner_limit = [entries_limit]
+
             return (
                 (
                     f'{prefix} FROM (SELECT {base_suffix} WHERE group_identifier IN '
-                    f'(SELECT group_identifier FROM (SELECT {suffix}) {filters}) {order_by})'
+                    f'(SELECT group_identifier FROM (SELECT {inner_suffix}) {filters}) {order_by})'
                 ),
-                limit + query_bindings,
+                inner_limit + query_bindings,
             )
 
         return f'{prefix} FROM (SELECT {suffix}) {filters}', limit + query_bindings
+
+    @staticmethod
+    def _build_events_query_parts(
+            filter_query: HistoryBaseEntryFilterQuery,
+    ) -> tuple[str, str, str]:
+        entry_type_filter_values: Sequence[int] | None = None
+        for filter_ in filter_query.filters:
+            if (
+                isinstance(filter_, DBMultiIntegerFilter) and
+                filter_.column == 'entry_type' and
+                filter_.operator == 'IN'
+            ):
+                entry_type_filter_values = filter_.values
+                break
+
+        include_chain = include_staking = False
+        if entry_type_filter_values is None:
+            include_chain = include_staking = True
+        else:
+            entry_types = {HistoryBaseEntryType(value) for value in entry_type_filter_values}
+            include_chain = len(entry_types & CHAIN_ENTRY_TYPES) > 0
+            include_staking = len(entry_types & STAKING_ENTRY_TYPES) > 0
+
+        if include_chain:
+            chain_fields = CHAIN_EVENT_FIELDS
+            chain_join = (
+                'LEFT JOIN chain_events_info ON '
+                'history_events.identifier=chain_events_info.identifier '
+            )
+        else:
+            chain_fields = CHAIN_EVENT_NULL_FIELDS
+            chain_join = ''
+
+        if include_staking:
+            staking_fields = ETH_STAKING_EVENT_FIELDS
+            staking_join = (
+                'LEFT JOIN eth_staking_events_info ON '
+                'history_events.identifier=eth_staking_events_info.identifier '
+            )
+        else:
+            staking_fields = ETH_STAKING_EVENT_NULL_FIELDS
+            staking_join = ''
+
+        return (
+            chain_fields,
+            staking_fields,
+            f'FROM history_events {chain_join}{staking_join}',
+        )
+
+    @staticmethod
+    def _create_history_events_count_query(
+            filter_query: HistoryBaseEntryFilterQuery,
+            entries_limit: int | None,
+            aggregate_by_group_ids: bool = False,
+    ) -> tuple[str, list]:
+        """Returns a lightweight sql query for counting history events."""
+        base_suffix = f'{filter_query.get_columns()} {filter_query.get_join_query()}'
+        if aggregate_by_group_ids:
+            exclusion_sql, exclusion_bindings = _build_matched_movement_exclusion(filter_query)
+            # Check if there are actual user filters (location, asset, etc.)
+            base_filters, _ = filter_query.prepare(
+                with_group_by=False,
+                with_pagination=False,
+                with_order=False,
+                without_ignored_asset_filter=True,
+            )
+            if not base_filters and entries_limit is None:
+                # Unfiltered: query group_identifier directly so SQLite can use the
+                # covering index without fetching full rows from the table.
+                return (
+                    f'SELECT group_identifier FROM history_events WHERE ({exclusion_sql}) GROUP BY group_identifier',  # noqa: E501
+                    exclusion_bindings,
+                )
+
+            filters, query_bindings = filter_query.prepare(
+                with_group_by=True,
+                with_pagination=False,
+                with_order=False,
+                without_ignored_asset_filter=True,
+                extra_conditions=[(exclusion_sql, exclusion_bindings)],
+            )
+        else:
+            filters, query_bindings = filter_query.prepare(
+                with_order=False,
+                with_pagination=False,
+            )
+
+        if entries_limit is None:
+            suffix, limit = base_suffix, []
+        else:
+            suffix, limit = (
+                f'* FROM (SELECT {base_suffix}) WHERE group_identifier IN ('
+                'SELECT DISTINCT group_identifier FROM history_events '
+                'ORDER BY timestamp DESC, sequence_index ASC LIMIT ?)'
+            ), [entries_limit]
+
+        return f'SELECT * FROM (SELECT {suffix}) {filters}', limit + query_bindings
 
     @overload
     def get_history_events(
@@ -907,11 +1247,7 @@ class DBHistoryEvents:
         list[tuple[int, EthDepositEvent]] | list[EthDepositEvent] |
         list[tuple[int, EthWithdrawalEvent]] | list[EthWithdrawalEvent]
     ):
-        """Get all events from the DB, deserialized depending on the event type
-
-        TODO: To not query all columns with all joins for all cases, we perhaps can
-        peek on the entry type of the filter and adjust the SELECT fields accordingly?
-        """
+        """Get all events from the DB, deserialized depending on the event type."""
         result = self._get_history_events_with_ignored_groups(
             cursor=cursor,
             filter_query=filter_query,
@@ -934,6 +1270,7 @@ class DBHistoryEvents:
             aggregate_by_group_ids=aggregate_by_group_ids,
             match_exact_events=match_exact_events,
             entries_limit=entries_limit,
+            include_order=True,
         )
         if filter_query.pagination is not None:
             base_query = f'SELECT * FROM ({base_query}) {filter_query.pagination.prepare()}'
@@ -947,7 +1284,7 @@ class DBHistoryEvents:
         data_start_idx = type_idx + 1
         failed_to_deserialize = False
         # Fixed position of group_has_ignored_assets (after entry_type, base, chain, staking).
-        # JOINs like customized_events_only may add columns at the end, so we use fixed index.
+        # JOINs like state_markers may add columns at the end, so we use fixed index.
         group_has_ignored_assets_idx = (
             type_idx + 1 + HISTORY_BASE_ENTRY_LENGTH +
             CHAIN_FIELD_LENGTH + ETH_STAKING_FIELD_LENGTH
@@ -1351,6 +1688,51 @@ class DBHistoryEvents:
                 )
         return assets
 
+    def get_history_event_group_position(
+            self,
+            group_identifier: str,
+            filter_query: HistoryBaseEntryFilterQuery,
+    ) -> int | None:
+        """Get the 0-based position of the given group in the filtered and sorted
+        list of groups (timestamp DESC, group_identifier as tiebreaker).
+
+        The filter_query is used to restrict which events are considered, matching
+        the same filtering applied when viewing history events.
+
+        Returns the position (0-based offset of the group among all distinct groups),
+        or None if the group does not exist in the filtered results.
+        """
+        with self.db.conn.read_ctx() as cursor:
+            # Build the full grouped query using the same logic as the main events query
+            # This correctly handles all filter types (EVM, Solana, etc.) with proper JOINs
+            query, query_bindings = self._create_history_events_query(
+                filter_query=filter_query,
+                entries_limit=None,
+                aggregate_by_group_ids=True,
+                include_order=False,
+            )
+
+            # Get the target group's max timestamp from the filtered groups
+            target_ts_result = cursor.execute(
+                f'SELECT MAX(timestamp) FROM ({query}) WHERE group_identifier = ?',
+                query_bindings + [group_identifier],
+            ).fetchone()
+            if target_ts_result is None or target_ts_result[0] is None:
+                return None
+
+            target_group_ts = target_ts_result[0]
+
+            # Count how many distinct groups in the filtered set sort before the target group
+            # in timestamp DESC order (with group_identifier as tiebreaker for equal timestamps)
+            return cursor.execute(
+                'SELECT COUNT(*) FROM ('
+                f'  SELECT group_identifier, MAX(timestamp) as group_ts FROM ({query})'
+                '  GROUP BY group_identifier'
+                '  HAVING group_ts > ? OR (group_ts = ? AND group_identifier < ?)'
+                ')',
+                query_bindings + [target_group_ts, target_group_ts, group_identifier],
+            ).fetchone()[0]
+
     def get_history_events_count(
             self,
             cursor: 'DBCursor',
@@ -1364,10 +1746,12 @@ class DBHistoryEvents:
         the number of events if any limit is applied, otherwise the second value matches
         the first.
         """
-        query_without_limit, query_without_limit_bindings = self._create_history_events_query(
-            filter_query=query_filter,
-            aggregate_by_group_ids=aggregate_by_group_ids,
-            entries_limit=None,
+        query_without_limit, query_without_limit_bindings = (
+            self._create_history_events_count_query(
+                filter_query=query_filter,
+                aggregate_by_group_ids=aggregate_by_group_ids,
+                entries_limit=None,
+            )
         )
         count_without_limit = cursor.execute(
             f'SELECT COUNT(*) FROM ({query_without_limit})',
@@ -1380,7 +1764,7 @@ class DBHistoryEvents:
             return count_without_limit, count_without_limit
 
         # Otherwise, get the limited count
-        query_with_limit, query_with_limit_bindings = self._create_history_events_query(
+        query_with_limit, query_with_limit_bindings = self._create_history_events_count_query(
             filter_query=query_filter,
             aggregate_by_group_ids=aggregate_by_group_ids,
             entries_limit=entries_limit,
@@ -1688,31 +2072,116 @@ class DBHistoryEvents:
         Returns a tuple containing the processed events, joined group ids dict, entries found,
         entries with limit, entries total, and group identifiers with ignored assets.
         """
-        movement_group_to_match_info, match_group_to_movement_info, joined_group_ids = {}, {}, {}
-        for match_id, movement_group_identifier, match_group_identifier, movement_group_count, match_group_count in cursor.execute(  # noqa: E501
-                'SELECT value AS match_id, '
+        movement_group_to_match_info: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
+        match_group_to_movement_info: dict[str, tuple[str, int]] = {}
+        joined_group_ids: dict[str, str] = {}
+        if len(events_result) == 0:
+            return (
+                events_result,
+                joined_group_ids,
+                entries_found,
+                entries_with_limit,
+                entries_total,
+                ignored_group_identifiers,
+            )
+
+        if aggregate_by_group_ids:
+            events_list = [event for _, event in cast('list[tuple[int, HistoryBaseEntry]]', events_result)]  # noqa: E501
+        else:
+            events_list = cast('list[HistoryBaseEntry]', events_result)
+
+        result_group_ids = {event.group_identifier for event in events_list}
+        group_ids_to_count: set[str] = set()
+        matched_rows: list[tuple[int, int, str, str, int, int]] = []
+        for chunk, placeholders in get_query_chunks(list(result_group_ids)):
+            # First, find the ids of all movements associated with the provided events in a cte,
+            # then load the info for these movements and all events that may be matched with them.
+            # This properly handles getting all associated events no matter which event from a
+            # matched pair or multi-match group is present in the events_list here.
+            for row in cursor.execute(
+                'WITH movement_ids AS ('
+                    'SELECT DISTINCT history_event_links.left_event_id '
+                    'FROM history_event_links JOIN history_events ON history_events.identifier IN '
+                    '(history_event_links.right_event_id, history_event_links.left_event_id) '
+                    'WHERE history_event_links.link_type = ? '
+                    f'AND history_events.group_identifier IN ({placeholders})'
+                ') SELECT history_event_links.left_event_id, history_event_links.right_event_id, '
                 'movement_events_join.group_identifier, match_events_join.group_identifier, '
-                '(SELECT COUNT(*) FROM history_events he2 '
-                'WHERE he2.group_identifier = movement_events_join.group_identifier) as movement_group_count, '  # noqa: E501
-                '(SELECT COUNT(*) FROM history_events he2 '
-                'WHERE he2.group_identifier = match_events_join.group_identifier) as match_group_count '  # noqa: E501
-                'FROM key_value_cache '
-                'JOIN history_events movement_events_join ON CAST(movement_events_join.identifier AS TEXT) = SUBSTR(name, ?) '  # noqa: E501
-                'JOIN history_events match_events_join ON CAST(match_events_join.identifier AS TEXT) = match_id '  # noqa: E501
-                'WHERE name LIKE ? and value != ?;',
+                'movement_events_join.entry_type, match_events_join.entry_type '
+                'FROM history_event_links '
+                'JOIN history_events movement_events_join ON '
+                'movement_events_join.identifier = history_event_links.left_event_id '
+                'JOIN history_events match_events_join ON '
+                'match_events_join.identifier = history_event_links.right_event_id '
+                'WHERE history_event_links.link_type = ? AND '
+                'history_event_links.left_event_id IN movement_ids',
                 (
-                    len(DBCacheDynamic.MATCHED_ASSET_MOVEMENT.name) + 2,
-                    f'{DBCacheDynamic.MATCHED_ASSET_MOVEMENT.name.lower()}%',
-                    ASSET_MOVEMENT_NO_MATCH_CACHE_VALUE,
+                    HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
+                    *chunk,
+                    HistoryEventLinkType.ASSET_MOVEMENT_MATCH.serialize_for_db(),
                 ),
-        ):
-            joined_group_ids[movement_group_identifier] = match_group_identifier
-            joined_group_ids[match_group_identifier] = match_group_identifier
-            movement_group_to_match_info[movement_group_identifier] = (
+            ):
+                matched_rows.append((
+                    int(row[0]),  # movement id
+                    int(row[1]),  # match id
+                    (movement_group_identifier := row[2]),
+                    (match_group_identifier := row[3]),
+                    int(row[4]),  # movement entry type
+                    int(row[5]),  # match entry type
+                ))
+                group_ids_to_count.add(movement_group_identifier)
+                group_ids_to_count.add(match_group_identifier)
+
+        if len(matched_rows) == 0:
+            return (
+                events_result,
+                joined_group_ids,
+                entries_found,
+                entries_with_limit,
+                entries_total,
+                ignored_group_identifiers,
+            )
+
+        group_counts: dict[str, int] = {}
+        for chunk, placeholders in get_query_chunks(list(group_ids_to_count)):
+            for row in cursor.execute(
+                f'SELECT group_identifier, COUNT(*) FROM history_events '
+                f'WHERE group_identifier IN ({placeholders}) GROUP BY group_identifier',
+                tuple(chunk),
+            ):
+                group_counts[row[0]] = row[1]
+
+        asset_movement_entry_type = HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.serialize_for_db()
+        for (
+            movement_id,
+            match_id,
+            movement_group_identifier,
+            match_group_identifier,
+            movement_entry_type,
+            match_entry_type,
+        ) in matched_rows:
+            movement_group_count = group_counts.get(movement_group_identifier, 0)
+            match_group_count = group_counts.get(match_group_identifier, 0)
+            if (
+                movement_entry_type == asset_movement_entry_type and
+                match_entry_type == asset_movement_entry_type
+            ):
+                canonical_group_identifier = (
+                    movement_group_identifier
+                    if movement_id < match_id else
+                    match_group_identifier
+                )
+                joined_group_ids[movement_group_identifier] = canonical_group_identifier
+                joined_group_ids[match_group_identifier] = canonical_group_identifier
+            else:
+                joined_group_ids[movement_group_identifier] = movement_group_identifier
+                joined_group_ids[match_group_identifier] = movement_group_identifier
+
+            movement_group_to_match_info[movement_group_identifier].append((
                 match_id,
                 match_group_identifier,
                 match_group_count,
-            )
+            ))
             match_group_to_movement_info[match_group_identifier] = (
                 movement_group_identifier,
                 movement_group_count,
@@ -1722,7 +2191,7 @@ class DBHistoryEvents:
                 # another movement, and this logic will run twice for one joined group.
                 entries_total -= 1
 
-        processed_events_result = []
+        processed_events_result: list[tuple[int, HistoryBaseEntry]] | list[HistoryBaseEntry] = []
         if aggregate_by_group_ids:
             # Aggregating by group. Need to ensure that for each movement/match group there is
             # only one event present. Process the events and for each event that is part of a
@@ -1730,66 +2199,142 @@ class DBHistoryEvents:
             # - adjust grouped_events_num to include the events from the other side of the movement
             # - skip the event if we have already processed an event from that movement/match group
             already_processed_matches: set[str] = set()
-            for grouped_events_num, event in events_result:  # type: ignore[misc]  # events_result is a different type depending on aggregate_by_group_ids
+            events_to_replace, processed_result_idx = {}, 0
+            movement_events_in_result = {}
+            for grouped_events_num, event in cast('list[tuple[int, HistoryBaseEntry]]', events_result):  # noqa: E501
                 if (
-                    (match_info := movement_group_to_match_info.get(event.group_identifier)) is not None and  # noqa: E501
+                    event.entry_type == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT and
+                    event.event_subtype != HistoryEventSubType.FEE
+                ):
+                    movement_events_in_result[event.group_identifier] = event
+
+                should_skip, matched_joined_group_count = False, 0
+                if (
+                    (match_info_list := movement_group_to_match_info.get(event.group_identifier)) is not None and  # noqa: E501
                     event.group_identifier in match_group_to_movement_info
                 ):  # This is a movement matched with a movement.
-                    _, match_group_identifier, joined_group_count = match_info
-                    should_skip = len({match_group_identifier, event.group_identifier} & already_processed_matches) != 0  # noqa: E501
-                elif match_info is not None:
-                    _, match_group_identifier, joined_group_count = match_info
-                    should_skip = match_group_identifier in already_processed_matches
+
+                    for _, matched_group_identifier, joined_count in match_info_list:
+                        matched_joined_group_count += joined_count
+                        if len({matched_group_identifier, event.group_identifier} & already_processed_matches) != 0:  # noqa: E501
+                            should_skip = True
+                        already_processed_matches.add(matched_group_identifier)
+                    already_processed_matches.add(event.group_identifier)
+                elif match_info_list is not None:
+                    for _, matched_group_identifier, joined_count in match_info_list:
+                        matched_joined_group_count += joined_count
+                        if matched_group_identifier in already_processed_matches:
+                            should_skip = True
+                        else:
+                            already_processed_matches.add(matched_group_identifier)
                 elif (movement_info := match_group_to_movement_info.get(event.group_identifier)) is not None:  # noqa: E501
-                    _, joined_group_count = movement_info
+                    movement_group_identifier, matched_joined_group_count = movement_info
                     should_skip = event.group_identifier in already_processed_matches
-                    match_group_identifier = event.group_identifier
-                else:
-                    should_skip, joined_group_count, match_group_identifier = False, 0, None
+                    already_processed_matches.add(event.group_identifier)
+                    # also load any other matched events associated with this movement.
+                    if (
+                        not should_skip and
+                        (match_info_list := movement_group_to_match_info.get(movement_group_identifier)) is not None  # noqa: E501
+                    ):
+                        for _, matched_group_id, joined_count in match_info_list:
+                            if matched_group_id == event.group_identifier:
+                                continue
+
+                            matched_joined_group_count += joined_count
+                            already_processed_matches.add(matched_group_id)
 
                 if should_skip:  # already processed the other side of this pair, so skip.
                     entries_found -= 1
                     entries_with_limit -= 1
                     continue
 
-                processed_events_result.append((grouped_events_num + joined_group_count, event))
-                if match_group_identifier is not None:
-                    already_processed_matches.add(match_group_identifier)
-
-        else:  # Not aggregating. Need to include the asset movements in their matched groups
-            events_by_group: dict[str, list[HistoryBaseEntry]] = defaultdict(list)
-            for event in events_result:
-                events_by_group[event.group_identifier].append(event)  # type: ignore
-
-            for group_identifier, events in events_by_group.items():
                 if (
-                    (movement_info := match_group_to_movement_info.get(group_identifier)) is not None and  # noqa: E501
-                    (match_info := movement_group_to_match_info.get(movement_group_id := movement_info[0])) is not None and  # noqa: E501
-                    len(match_events := [x for x in events if str(x.identifier) == match_info[0]]) == 1  # noqa: E501
+                    (movement_group_id := joined_group_ids.get(event.group_identifier)) is not None and  # noqa: E501
+                    event.entry_type != HistoryBaseEntryType.ASSET_MOVEMENT_EVENT
                 ):
-                    insert_index = events.index(match_events[0]) + 1  # insert immediately after the matched event  # noqa: E501
-                    if (
-                        len(events) > insert_index and
-                        (next_event := events[insert_index]).entry_type == HistoryBaseEntryType.ASSET_MOVEMENT_EVENT and  # noqa: E501
-                        next_event.event_subtype == HistoryEventSubType.FEE
-                    ):  # if the matched event is an asset movement with a fee,
-                        # insert after the fee instead of between the movement and its fee
-                        insert_index += 1
+                    events_to_replace[movement_group_id] = processed_result_idx
 
-                    movement_events_result = self._get_history_events_with_ignored_groups(
-                        cursor=cursor,
-                        filter_query=HistoryEventFilterQuery.make(
-                            group_identifiers=[movement_group_id],
-                        ),
-                        entries_limit=None,
-                    )
-                    movement_events: list[HistoryBaseEntry] = movement_events_result.events  # type: ignore[assignment]  # aggregate_by_group_ids=False for this query.
-                    events[insert_index:insert_index] = movement_events
-                    ignored_group_identifiers.update(
-                        movement_events_result.ignored_group_identifiers,
-                    )
+                processed_events_result.append(
+                    (grouped_events_num + matched_joined_group_count, event),   # type: ignore[arg-type]  # will be a list of tuple[int, HistoryBaseEntry]
+                )
+                processed_result_idx += 1
 
-                processed_events_result.extend(events)  # type: ignore[arg-type]
+            # Replace any matched events with their associated movement since frontend requires
+            # the movement to be the header event for matched pairs when aggregating by group id.
+            missing_movement_group_ids: list[str] = []
+            for movement_group_id, idx in events_to_replace.items():
+                if (movement_event := movement_events_in_result.get(movement_group_id)) is not None:  # noqa: E501
+                    processed_events_result[idx] = (processed_events_result[idx][0], movement_event)  # type: ignore  # will be a list of tuple[int, HistoryBaseEntry]  # noqa: E501
+                else:
+                    missing_movement_group_ids.append(movement_group_id)
+
+            if len(missing_movement_group_ids) != 0:
+                for event in self.get_history_events_internal(
+                    cursor=cursor,
+                    filter_query=HistoryEventFilterQuery.make(
+                        group_identifiers=missing_movement_group_ids,
+                        entry_types=IncludeExcludeFilterData([HistoryBaseEntryType.ASSET_MOVEMENT_EVENT]),
+                        exclude_subtypes=[HistoryEventSubType.FEE],
+                    ),
+                ):
+                    idx = events_to_replace[event.group_identifier]
+                    processed_events_result[idx] = (processed_events_result[idx][0], event)  # type: ignore  # will be a list of tuple[int, HistoryBaseEntry]
+
+        else:  # Not aggregating. Need to include all associated events in the movement groups.
+            events_by_group: dict[str, list[HistoryBaseEntry]] = defaultdict(list)
+            for event in cast('list[HistoryBaseEntry]', events_result):
+                events_by_group[event.group_identifier].append(event)
+
+            # Collect any group ids that are associated with some of the current events, but that
+            # are not already present in the current event list.
+            needed_group_ids: set[str] = set()
+            for group_identifier in events_by_group:
+                if (match_info_list := movement_group_to_match_info.get(group_identifier)) is not None:  # noqa: E501
+                    needed_group_ids.update(
+                        group_id for _, group_id, _ in match_info_list
+                        if group_id not in events_by_group
+                    )
+                if (movement_info := match_group_to_movement_info.get(group_identifier)) is not None:  # noqa: E501
+                    if (movement_group_id := movement_info[0]) not in events_by_group:
+                        needed_group_ids.add(movement_group_id)
+
+                    # also include group ids of any other events matched with this movement.
+                    if (match_info_list := movement_group_to_match_info.get(movement_group_id)) is not None:  # noqa: E501
+                        needed_group_ids.update(
+                            group_id for _, group_id, _ in match_info_list
+                            if group_id not in events_by_group
+                        )
+
+            # Load the actual events for these associated groups
+            joined_events_by_group: dict[str, list[HistoryBaseEntry]] = defaultdict(list)
+            if len(needed_group_ids) > 0:
+                joined_events_result = self._get_history_events_with_ignored_groups(
+                    cursor=cursor,
+                    filter_query=HistoryEventFilterQuery.make(
+                        group_identifiers=list(needed_group_ids),
+                    ),
+                    entries_limit=None,
+                )
+                for joined_event in joined_events_result.events:
+                    joined_events_by_group[joined_event.group_identifier].append(joined_event)  # type: ignore  # will be a list of HistoryBaseEntry
+                ignored_group_identifiers.update(
+                    joined_events_result.ignored_group_identifiers,
+                )
+
+            # Include the newly loaded events with their associated groups.
+            for group_identifier, events in events_by_group.items():
+                if (match_info_list := movement_group_to_match_info.get(group_identifier)) is not None:  # noqa: E501
+                    for _, matched_group_id, _ in match_info_list:
+                        events.extend(joined_events_by_group[matched_group_id])
+                elif (movement_info := match_group_to_movement_info.get(group_identifier)) is not None:  # noqa: E501
+                    events.extend(joined_events_by_group[movement_group_id := movement_info[0]])
+                    # also include all events from the groups of any other events that are
+                    # matched with this movement.
+                    if (match_info_list := movement_group_to_match_info.get(movement_group_id)) is not None:  # noqa: E501
+                        for _, group_id, _ in match_info_list:
+                            events.extend(joined_events_by_group[group_id])
+
+                processed_events_result.extend(sorted(events, key=lambda event: event.timestamp))  # type: ignore  # will be a list of HistoryBaseEntry
 
         return (
             processed_events_result,
